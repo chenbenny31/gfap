@@ -33,6 +33,7 @@ const (
 	resultOK processResult = iota
 	resultRateLimited
 	resultSkipped
+	resultError
 )
 
 type Crawler struct {
@@ -155,7 +156,7 @@ func (c *Crawler) process(workerId int, url string, client *auth.Client) process
 					time.Sleep(backoff)
 					return resultRateLimited
 				}
-				return resultSkipped
+				return resultError
 			}
 			doc, err = goquery.NewDocumentFromReader(resp.Body)
 			resp.Body.Close()
@@ -183,7 +184,7 @@ func (c *Crawler) process(workerId int, url string, client *auth.Client) process
 		if strings.Contains(url, c.cfg.VideoPattern) {
 			c.redis.PushOverflow(ctx, url)
 		}
-		return resultSkipped
+		return resultError
 	}
 
 	if err != nil {
@@ -318,6 +319,7 @@ func (c *Crawler) canonicalize(raw string) string {
 func (c *Crawler) worker(workerId int, staticProxyURL string) {
 	client := auth.NewClient(c.jar, staticProxyURL)
 	consecFails := 0
+	consecErrors := 0
 	limiter := rate.NewLimiter(rate.Every(c.cfg.RateLimit), 1)
 	for url := range c.queue {
 		c.rateMu.Lock()
@@ -329,15 +331,26 @@ func (c *Crawler) worker(workerId int, staticProxyURL string) {
 		}
 		limiter.Wait(context.Background())
 		result := c.process(workerId, url, client)
-		if result == resultRateLimited {
+		switch result {
+		case resultRateLimited:
 			consecFails++
+			consecErrors = 0
 			if consecFails >= 10 {
-				log.Printf("[INFO] Worker-%d switching to rotating proxy after 10 consecutive failures\n", workerId)
+				log.Printf("[INFO] Worker-%d switching to rotating proxy after 10 rate limits\n", workerId)
 				client = auth.NewClient(c.jar, c.cfg.RotatingProxyURL)
-				consecFails = 0
+				consecFails, consecErrors = 0, 0
 			}
-		} else {
+
+		case resultError:
+			consecErrors++
 			consecFails = 0
+			if consecErrors >= 20 {
+				log.Printf("[INFO] Worker-%d switching to rotating proxy after 20 consecutive errors\n", workerId)
+				client = auth.NewClient(c.jar, c.cfg.RotatingProxyURL)
+				consecFails, consecErrors = 0, 0
+			}
+		default:
+			consecFails, consecErrors = 0, 0
 		}
 		c.inFlight.Add(-1)
 		metrics.QueueSize.Set(float64(c.inFlight.Load()))
