@@ -175,7 +175,7 @@ func (c *Crawler) process(workerId int, url string, client *auth.Client) process
 		}
 
 		if try < maxRetries {
-			log.Printf("[WARN] Retry %d/%d for %s: %v\n", try, maxRetries, url, err)
+			log.Printf("[WARN] Worker-%d: Retry %d/%d for %s: %v\n", workerId, try, maxRetries, url, err)
 			time.Sleep(time.Duration(try) * time.Second)
 		}
 	}

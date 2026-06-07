@@ -47,10 +47,6 @@ func main() {
 
 	c := crawler.New(cfg, redis, mongo)
 	go metrics.Serve(cfg.MetricsPort, c.Stop)
-	if err := c.Login(); err != nil {
-		log.Fatalf("[FATAL] login failed: %v", err)
-	}
-	log.Println("[INFO] Logged in successfully")
 
 	if *testMode {
 		log.Println("[INFO] Running in test mode")

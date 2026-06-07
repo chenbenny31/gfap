@@ -46,8 +46,9 @@ func (c *Client) Get(url string) (*http.Response, error) {
 
 func (c *Client) Login(loginURL, username, password string) error {
 	resp, err := c.PostForm(loginURL, url.Values{
-		"username": {username},
-		"password": {password},
+		"username":     {username},
+		"password":     {password},
+		"submit_login": {"Sign In"},
 	})
 	if err != nil {
 		return err
