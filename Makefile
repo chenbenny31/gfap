@@ -1,7 +1,7 @@
 METRICS_PORT = 2112
 BINARY = ./crawler
 
-.PHONY: help infra-start infra-stop infra-logs build start resume test stop metrics logs
+.PHONY: help infra-start infra-stop infra-logs build fresh resume test stop metrics logs reset-bloom
 
 help:
 	@echo "gfap — commands:"
@@ -9,8 +9,9 @@ help:
 	@echo "  make infra-stop   stop Docker services"
 	@echo "  make infra-logs   log Docker services"
 	@echo "  make build        build crawler binary"
-	@echo "  make start        first run — seed from seeds.txt"
+	@echo "  make fresh        first run — drops corpus, seeds from seeds.txt"
 	@echo "  make resume       resume production crawl"
+	@echo " make reset-bloom   delete bloom filter only, safe for MongoDB"
 	@echo "  make test         bounded test crawl"
 	@echo "  make stop         graceful crawler shutdown"
 	@echo "  make metrics      print Prometheus metrics"
@@ -21,6 +22,8 @@ help:
 
 infra-start:
 	docker-compose up -d
+	@docker exec gfap-redis-1 redis-cli EXISTS crawler:bloom | grep -q 1 || docker exec gfap-redis-1 redis-cli BF.RESERVE crawler:bloom 0.00001 1000000000 NONSCALING
+	@echo "Bloom: $$(docker exec gfap-redis-1 redis-cli BF.INFO crawler:bloom | grep -A1 Capacity | tail -1) capacity"
 	@echo "Prometheus: http://localhost:9090"
 	@echo "Metrics: http://localhost:$(METRICS_PORT)/metrics"
 
@@ -33,13 +36,19 @@ infra-logs:
 build:
 	go build -o $(BINARY) cmd/crawler/main.go
 
-start: build
+fresh: build
+	@echo "WARNING: drops MongoDB corpus and flushes Redis, irreversible."
+	@read -p "Type 'fresh' to continue: " a && [ "$$a" = "fresh" ] || { echo aborted; exit 1; }
 	-@pkill -x crawler
-	@nohup $(BINARY) -fresh > /dev/null 2>&1 & echo "Crawler started (fresh)"
+	@nohub $(BINAYR) -fresh > /dev/null 2>&1 & echo "Crawler started (fresh)"
 
 resume: build
 	-@pkill -x crawler
-	@nohup $(BINARY) > /dev/null 2>&1 & echo "Cralwer resumed"
+	@nohup $(BINARY) > /dev/null 2>&1 & echo "Crawler resumed"
+
+reset-bloom:
+	docker exec gfap-redis-1 redis-cli DEL crawler:bloom
+	@echo "Bloom filter deleted. Run make resume to re-init and re-seed from MongoDB."
 
 test:
 	go run cmd/crawler/main.go -test

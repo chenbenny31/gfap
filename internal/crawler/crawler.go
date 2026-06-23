@@ -48,10 +48,11 @@ type Crawler struct {
 	inFlight atomic.Int64
 
 	// production only
-	stopChan   chan struct{}
-	stopOnce   sync.Once
-	rateMu     sync.Mutex
-	retryAfter time.Time
+	stopChan chan struct{}
+	stopOnce sync.Once
+	// DISABLE global retryAfter logic
+	//rateMu     sync.Mutex
+	//retryAfter time.Time
 
 	// test only
 	debug bool
@@ -150,9 +151,9 @@ func (c *Crawler) process(workerId int, url string, client *auth.Client) process
 				if strings.Contains(url, c.cfg.VideoPattern) {
 					backoff := time.Duration(try) * 60 * time.Second
 					log.Printf("[WARN] Worker-%d: %s returned %d, backing off %s\n", workerId, url, resp.StatusCode, backoff)
-					c.rateMu.Lock()
-					c.retryAfter = time.Now().Add(backoff)
-					c.rateMu.Unlock()
+					//c.rateMu.Lock()
+					//c.retryAfter = time.Now().Add(backoff)
+					//c.rateMu.Unlock()
 					time.Sleep(backoff)
 					return resultRateLimited
 				}
@@ -164,9 +165,9 @@ func (c *Crawler) process(workerId int, url string, client *auth.Client) process
 				if strings.Contains(doc.Find("title").Text(), "Rate Limited") {
 					backoff := time.Duration(try) * 30 * time.Second
 					log.Printf("[WARN] Worker-%d: Rate limited on %s, backing off %s\n", workerId, url, backoff)
-					c.rateMu.Lock()
-					c.retryAfter = time.Now().Add(backoff)
-					c.rateMu.Unlock()
+					//c.rateMu.Lock()
+					//c.retryAfter = time.Now().Add(backoff)
+					//c.rateMu.Unlock()
 					time.Sleep(backoff)
 					return resultRateLimited
 				}
@@ -182,7 +183,9 @@ func (c *Crawler) process(workerId int, url string, client *auth.Client) process
 
 	if doc == nil {
 		if strings.Contains(url, c.cfg.VideoPattern) {
-			c.redis.PushOverflow(ctx, url)
+			if err := c.redis.PushOverflow(context.Background(), url); err == nil {
+				c.inFlight.Add(1) // balance worker's bottom Add(-1)
+			}
 		}
 		return resultError
 	}
@@ -281,6 +284,8 @@ func (c *Crawler) Resume() {
 
 func (c *Crawler) Clear() {
 	ctx := context.Background()
+	n, _ := c.mongo.Count(ctx)
+	log.Printf("[DANGER] dropping MongoDB corpus (%d docs) and flushing redis\n", n)
 	c.mongo.Drop(ctx)
 	c.redis.FlushDB(ctx)
 	log.Println("[INFO] Cleared MongoDB and Redis")
@@ -322,13 +327,13 @@ func (c *Crawler) worker(workerId int, staticProxyURL string) {
 	consecErrors := 0
 	limiter := rate.NewLimiter(rate.Every(c.cfg.RateLimit), 1)
 	for url := range c.queue {
-		c.rateMu.Lock()
-		wait := time.Until(c.retryAfter)
-		c.rateMu.Unlock()
-		if wait > 0 {
-			time.Sleep(wait)
-			limiter.Reserve()
-		}
+		//c.rateMu.Lock()
+		//wait := time.Until(c.retryAfter)
+		//c.rateMu.Unlock()
+		//if wait > 0 {
+		//	time.Sleep(wait)
+		//	limiter.Reserve()
+		//}
 		limiter.Wait(context.Background())
 		result := c.process(workerId, url, client)
 		switch result {
@@ -336,23 +341,25 @@ func (c *Crawler) worker(workerId int, staticProxyURL string) {
 			consecFails++
 			consecErrors = 0
 			if consecFails >= 10 {
-				log.Printf("[INFO] Worker-%d switching to rotating proxy after 10 rate limits\n", workerId)
-				client = auth.NewClient(c.jar, c.cfg.RotatingProxyURL)
-				consecFails, consecErrors = 0, 0
+				sleep := time.Duration(consecFails) * 5 * time.Minute
+				log.Printf("[WARN] Worker-%d: 10 consecutive rate limits, backpressure\n", workerId)
+				time.Sleep(sleep)
+				// limiter.Reserve()
 			}
 
 		case resultError:
 			consecErrors++
 			consecFails = 0
 			if consecErrors >= 20 {
-				log.Printf("[INFO] Worker-%d switching to rotating proxy after 20 consecutive errors\n", workerId)
-				client = auth.NewClient(c.jar, c.cfg.RotatingProxyURL)
-				consecFails, consecErrors = 0, 0
+				sleep := time.Duration(consecErrors) * 30 * time.Second
+				log.Printf("[WARN] Worker-%d: 20 consecutive errors, backpressure\n", workerId)
+				time.Sleep(sleep)
+				limiter.Reserve()
 			}
 		default:
 			consecFails, consecErrors = 0, 0
 		}
-		c.inFlight.Add(-1)
+		c.inFlight.Add(-1) // now un-conditional
 		metrics.QueueSize.Set(float64(c.inFlight.Load()))
 	}
 }

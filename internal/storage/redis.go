@@ -2,6 +2,8 @@ package storage
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -29,7 +31,7 @@ func NewRedis(addr string) (*Redis, error) {
 // BloomInit reserves the Bloom filter with the config
 func (r *Redis) BloomInit(ctx context.Context) error {
 	err := r.client.BFReserve(ctx, bloomKey, bloomErrorRate, bloomCapacity).Err()
-	if err != nil && err.Error() == "ERR item exists" {
+	if err != nil && strings.Contains(err.Error(), "exists") {
 		// filter exists but still ensure AOF is on
 		return r.client.ConfigSet(ctx, "appendonly", "yes").Err()
 	}
@@ -73,4 +75,21 @@ func (r *Redis) Close() {
 
 func (r *Redis) BloomExists(ctx context.Context, url string) (bool, error) {
 	return r.client.BFExists(ctx, bloomKey, url).Result()
+}
+
+// BloomReset deletes only the bloom filter, not overflow or MongoDB
+func (r *Redis) BloomReset(ctx context.Context) error {
+	return r.client.Del(ctx, bloomKey).Err()
+}
+
+// BloomVerify aborts startup if filter is missing or wrong capacity
+func (r *Redis) BloomVerify(ctx context.Context) error {
+	info, err := r.client.BFInfo(ctx, bloomKey).Result()
+	if err != nil {
+		return fmt.Errorf("bloom missing/unreadable: %w", err)
+	}
+	if info.Capacity != bloomCapacity {
+		return fmt.Errorf("bloom capacity %d, expected %d, reset and re-init", info.Capacity, bloomCapacity)
+	}
+	return nil
 }

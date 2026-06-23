@@ -47,6 +47,10 @@ func main() {
 
 	c := crawler.New(cfg, redis, mongo)
 	go metrics.Serve(cfg.MetricsPort, c.Stop)
+	if err := c.Login(); err != nil {
+		log.Fatalf("[FATAL] login failed: %v", err)
+	}
+	log.Println("[INFO] crawler logged in successfully")
 
 	if *testMode {
 		log.Println("[INFO] Running in test mode")
@@ -64,6 +68,9 @@ func main() {
 	} else {
 		if err := redis.BloomInit(context.Background()); err != nil {
 			log.Fatalf("[ERROR] Bloom init failed: %v\n", err)
+		}
+		if err := redis.BloomVerify(context.Background()); err != nil {
+			log.Fatalf("[ERROR] Bloom verify failed: %v\n", err)
 		}
 		log.Println("[INFO] Running in production mode")
 		c.Resume()

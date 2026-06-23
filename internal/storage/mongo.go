@@ -66,3 +66,7 @@ func (m *Mongo) Drop(ctx context.Context) error {
 func (m *Mongo) Close() {
 	m.client.Disconnect(context.Background())
 }
+
+func (m *Mongo) Count(ctx context.Context) (int64, error) {
+	return m.col.CountDocuments(ctx, bson.M{})
+}
