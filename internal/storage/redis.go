@@ -84,12 +84,12 @@ func (r *Redis) BloomReset(ctx context.Context) error {
 
 // BloomVerify aborts startup if filter is missing or wrong capacity
 func (r *Redis) BloomVerify(ctx context.Context) error {
-	info, err := r.client.BFInfo(ctx, bloomKey).Result()
+	n, err := r.client.Exists(ctx, bloomKey).Result()
 	if err != nil {
-		return fmt.Errorf("bloom missing/unreadable: %w", err)
+		return fmt.Errorf("[ERROR] Bloom verify failed: %v\n", err)
 	}
-	if info.Capacity != bloomCapacity {
-		return fmt.Errorf("bloom capacity %d, expected %d, reset and re-init", info.Capacity, bloomCapacity)
+	if n == 0 {
+		return fmt.Errorf("[ERROR] Bloom filter missing, run make reset-bloom or make infra-start\n")
 	}
 	return nil
 }

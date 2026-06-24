@@ -22,6 +22,7 @@ help:
 
 infra-start:
 	docker-compose up -d
+	@sleep 3
 	@docker exec gfap-redis-1 redis-cli EXISTS crawler:bloom | grep -q 1 || docker exec gfap-redis-1 redis-cli BF.RESERVE crawler:bloom 0.00001 1000000000 NONSCALING
 	@echo "Bloom: $$(docker exec gfap-redis-1 redis-cli BF.INFO crawler:bloom | grep -A1 Capacity | tail -1) capacity"
 	@echo "Prometheus: http://localhost:9090"
@@ -40,7 +41,7 @@ fresh: build
 	@echo "WARNING: drops MongoDB corpus and flushes Redis, irreversible."
 	@read -p "Type 'fresh' to continue: " a && [ "$$a" = "fresh" ] || { echo aborted; exit 1; }
 	-@pkill -x crawler
-	@nohub $(BINAYR) -fresh > /dev/null 2>&1 & echo "Crawler started (fresh)"
+	@nohub $(BINARY) -fresh > /dev/null 2>&1 & echo "Crawler started (fresh)"
 
 resume: build
 	-@pkill -x crawler
