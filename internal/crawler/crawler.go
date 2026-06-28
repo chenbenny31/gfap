@@ -50,9 +50,6 @@ type Crawler struct {
 	// production only
 	stopChan chan struct{}
 	stopOnce sync.Once
-	// DISABLE global retryAfter logic
-	//rateMu     sync.Mutex
-	//retryAfter time.Time
 
 	// test only
 	debug bool
@@ -107,7 +104,8 @@ func (c *Crawler) enqueue(url string) {
 	}
 }
 
-func (c *Crawler) drainOverflow(ctx context.Context) {
+func (c *Crawler) drainOverflow(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
 	for {
 		select {
 		case <-ctx.Done():
@@ -129,15 +127,13 @@ func (c *Crawler) drainOverflow(ctx context.Context) {
 	}
 }
 
-func (c *Crawler) process(workerId int, url string, client *auth.Client) processResult {
+func (c *Crawler) process(ctx context.Context, workerId int, url string, client *auth.Client) processResult {
 	url = c.canonicalize(url)
 	if url == "" {
 		return resultSkipped
 	}
 
-	ctx := context.Background()
 	var err error // err is re-used
-
 	var resp *http.Response
 	var doc *goquery.Document
 
@@ -151,10 +147,11 @@ func (c *Crawler) process(workerId int, url string, client *auth.Client) process
 				if strings.Contains(url, c.cfg.VideoPattern) {
 					backoff := time.Duration(try) * 60 * time.Second
 					log.Printf("[WARN] Worker-%d: %s returned %d, backing off %s\n", workerId, url, resp.StatusCode, backoff)
-					//c.rateMu.Lock()
-					//c.retryAfter = time.Now().Add(backoff)
-					//c.rateMu.Unlock()
-					time.Sleep(backoff)
+					select {
+					case <-ctx.Done():
+						return resultSkipped
+					case <-time.After(backoff):
+					}
 					return resultRateLimited
 				}
 				return resultError
@@ -165,10 +162,11 @@ func (c *Crawler) process(workerId int, url string, client *auth.Client) process
 				if strings.Contains(doc.Find("title").Text(), "Rate Limited") {
 					backoff := time.Duration(try) * 30 * time.Second
 					log.Printf("[WARN] Worker-%d: Rate limited on %s, backing off %s\n", workerId, url, backoff)
-					//c.rateMu.Lock()
-					//c.retryAfter = time.Now().Add(backoff)
-					//c.rateMu.Unlock()
-					time.Sleep(backoff)
+					select {
+					case <-ctx.Done():
+						return resultSkipped
+					case <-time.After(backoff):
+					}
 					return resultRateLimited
 				}
 				break
@@ -177,14 +175,19 @@ func (c *Crawler) process(workerId int, url string, client *auth.Client) process
 
 		if try < maxRetries {
 			log.Printf("[WARN] Worker-%d: Retry %d/%d for %s: %v\n", workerId, try, maxRetries, url, err)
-			time.Sleep(time.Duration(try) * time.Second)
+			select {
+			case <-ctx.Done():
+				return resultSkipped
+			case <-time.After(time.Duration(try) * time.Second):
+			}
 		}
 	}
 
+	// use ctx for overflow push context
 	if doc == nil {
 		if strings.Contains(url, c.cfg.VideoPattern) {
-			if err := c.redis.PushOverflow(context.Background(), url); err == nil {
-				c.inFlight.Add(1) // balance worker's bottom Add(-1)
+			if err := c.redis.PushOverflow(ctx, url); err == nil {
+				c.inFlight.Add(1)
 			}
 		}
 		return resultError
@@ -321,50 +324,63 @@ func (c *Crawler) canonicalize(raw string) string {
 
 // --- production only ---
 
-func (c *Crawler) worker(workerId int, staticProxyURL string) {
+func (c *Crawler) worker(ctx context.Context, workerId int, staticProxyURL string, wg *sync.WaitGroup) {
+	defer wg.Done()
 	client := auth.NewClient(c.jar, staticProxyURL)
 	consecFails := 0
 	consecErrors := 0
 	limiter := rate.NewLimiter(rate.Every(c.cfg.RateLimit), 1)
-	for url := range c.queue {
-		//c.rateMu.Lock()
-		//wait := time.Until(c.retryAfter)
-		//c.rateMu.Unlock()
-		//if wait > 0 {
-		//	time.Sleep(wait)
-		//	limiter.Reserve()
-		//}
-		limiter.Wait(context.Background())
-		result := c.process(workerId, url, client)
-		switch result {
-		case resultRateLimited:
-			consecFails++
-			consecErrors = 0
-			if consecFails >= 10 {
-				sleep := time.Duration(consecFails) * 5 * time.Minute
-				log.Printf("[WARN] Worker-%d: 10 consecutive rate limits, backpressure\n", workerId)
-				time.Sleep(sleep)
-				// limiter.Reserve()
-			}
-
-		case resultError:
-			consecErrors++
-			consecFails = 0
-			if consecErrors >= 20 {
-				sleep := time.Duration(consecErrors) * 30 * time.Second
-				log.Printf("[WARN] Worker-%d: 20 consecutive errors, backpressure\n", workerId)
-				time.Sleep(sleep)
-				limiter.Reserve()
-			}
+	for {
+		// priority check, stop before picking new URL
+		select {
+		case <-c.stopChan:
+			return
 		default:
-			consecFails, consecErrors = 0, 0
 		}
-		c.inFlight.Add(-1) // now un-conditional
-		metrics.QueueSize.Set(float64(c.inFlight.Load()))
+		select {
+		case <-c.stopChan:
+			return
+		case url := <-c.queue:
+			limiter.Wait(ctx)
+			result := c.process(ctx, workerId, url, client)
+			c.inFlight.Add(-1) // unconditional before switch
+			metrics.QueueSize.Set(float64(c.inFlight.Load()))
+			switch result {
+			case resultRateLimited:
+				consecFails++
+				consecErrors = 0
+				if consecFails >= 10 {
+					sleep := time.Duration(consecFails) * 5 * time.Minute
+					log.Printf(
+						"[WARN] Worker-%d: %d consecutive rate limits, backing off %s\n", workerId, consecFails, sleep)
+					select {
+					case <-c.stopChan:
+						return
+					case <-time.After(sleep):
+					}
+				}
+			case resultError:
+				consecErrors++
+				consecFails = 0
+				if consecErrors >= 20 {
+					sleep := time.Duration(consecErrors) * 30 * time.Second
+					log.Printf(
+						"[WARN] Worker-%d: %d consecutive errors, backing off %s\n", workerId, consecErrors, sleep)
+					select {
+					case <-c.stopChan:
+						return
+					case <-time.After(sleep):
+					}
+				}
+			default:
+				consecFails, consecErrors = 0, 0
+			}
+		}
 	}
 }
 
-func (c *Crawler) idleMonitor(ctx context.Context, baseUrl string) {
+func (c *Crawler) idleMonitor(ctx context.Context, baseUrl string, wg *sync.WaitGroup) {
+	defer wg.Done()
 	ticker := time.NewTicker(idleTimeout)
 	defer ticker.Stop()
 	for {
@@ -389,19 +405,23 @@ func (c *Crawler) Stop() {
 
 func (c *Crawler) Run(url string) {
 	ctx, cancel := context.WithCancel(context.Background())
-	go c.drainOverflow(ctx)
-	go c.idleMonitor(ctx, url)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go c.drainOverflow(ctx, &wg)
+	wg.Add(1)
+	go c.idleMonitor(ctx, url, &wg)
 	for i := 0; i < c.cfg.Workers; i++ {
 		proxyURL := ""
 		if i < len(c.cfg.StaticProxyURLs) {
 			proxyURL = c.cfg.StaticProxyURLs[i]
 		}
-		go c.worker(i, proxyURL)
+		wg.Add(1)
+		go c.worker(ctx, i, proxyURL, &wg)
 	}
 	c.enqueue(url)
 	<-c.stopChan
 	cancel()
-	close(c.queue)
+	wg.Wait()
 	log.Printf("[INFO] Crawler stopped - %d videos, %d targets\n", c.Count(), c.TargetCount())
 }
 
@@ -429,32 +449,41 @@ func (c *Crawler) Login() error {
 
 // --- test only ---
 
-func (c *Crawler) workerTest(workerId int) {
+func (c *Crawler) workerTest(ctx context.Context, workerId int) {
 	proxyURL := ""
 	if workerId < len(c.cfg.StaticProxyURLs) {
 		proxyURL = c.cfg.StaticProxyURLs[workerId]
 	}
 	client := auth.NewClient(c.jar, proxyURL)
 	limiter := rate.NewLimiter(rate.Every(c.cfg.RateLimit), 1)
-	for url := range c.queue {
-		if c.Count() < maxTestVideos {
-			limiter.Wait(context.Background())
-			c.process(workerId, url, client)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case url := <-c.queue:
+			if c.Count() < maxTestVideos {
+				limiter.Wait(ctx)
+				c.process(ctx, workerId, url, client)
+			}
+			c.inFlight.Add(-1)
+			metrics.QueueSize.Set(float64(c.inFlight.Load()))
 		}
-		c.inFlight.Add(-1)
-		metrics.QueueSize.Set(float64(c.inFlight.Load()))
 	}
 }
 
 func (c *Crawler) RunTest(url string) {
 	c.debug = true
 	ctx, cancel := context.WithCancel(context.Background())
-	go c.drainOverflow(ctx)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go c.drainOverflow(ctx, &wg)
 	for i := 0; i < c.cfg.Workers; i++ {
+		wg.Add(1)
 		go func(workerId int) {
+			defer wg.Done()
 			offset := time.Duration(workerId) * c.cfg.RateLimit / time.Duration(c.cfg.Workers)
 			time.Sleep(offset)
-			c.workerTest(workerId)
+			c.workerTest(ctx, workerId)
 		}(i)
 	}
 	c.enqueue(url)
@@ -462,7 +491,7 @@ func (c *Crawler) RunTest(url string) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	cancel()
-	close(c.queue)
+	wg.Wait()
 	log.Printf("[INFO] Test finished - %d videos, %d targets\n", c.Count(), c.TargetCount())
 }
 

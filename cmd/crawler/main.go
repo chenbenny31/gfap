@@ -8,6 +8,8 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"gfap/internal/config"
 	"gfap/internal/crawler"
@@ -47,6 +49,14 @@ func main() {
 
 	c := crawler.New(cfg, redis, mongo)
 	go metrics.Serve(cfg.MetricsPort, c.Stop)
+	// handle SIGTERM (k8s pod deletion) and SIGINT
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		received := <-sig
+		log.Printf("[INFO] Signal received: %s, stopping crawler\n", received)
+		c.Stop()
+	}()
 	if err := c.Login(); err != nil {
 		log.Fatalf("[FATAL] login failed: %v", err)
 	}
