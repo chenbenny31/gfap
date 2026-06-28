@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gfap-config
+  namespace: gfap
+data:
+  REDIS_ADDR: "redis:6379"
+  MONGO_URI: "mongodb://mongo:27017"

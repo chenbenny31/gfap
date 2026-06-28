@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gfap-crawler
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: gfap-crawler
+  template:
+    metadata:
+      labels:
+        app: gfap-crawler
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "2112"
+        prometheus.io/path: "/metrics"
+    spec:
+      initContainers:
+        - name: bloom-init
+          image: redis/redis-stack:latest
+          command:
+            - sh
+            - -c
+            - |
+              echo "Checking bloom filter..."
+              EXISTS=$(redis-cli -h redis -p 6379 EXISTS crawler:bloom)
+              if [ "$EXISTS" = "0" ]; then
+                echo "Reserving bloom filter..."
+                redis-cli -h redis -p 6379 BF.RESERVE crawler:bloom 0.00001 1000000000 NONSCALING
+                echo "Bloom filter reserved."
+              else
+                echo "Bloom filter already exists, skipping."
+              fi
+      containers:
+        - name: gfap-crawler
+          image: gfap-crawler:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 2112
+          envFrom:
+            - configMapRef:
+                name: gfap-config
+            - secretRef:
+                name: gfap-secret
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: 2112
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gfap-crawler
+spec:
+  selector:
+    app: gfap-crawler
+  ports:
+    - port: 2112
+      targetPort: 2112

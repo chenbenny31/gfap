@@ -19,6 +19,9 @@ help:
 	@echo "  make status       show service and crawler status"
 	@echo "  make restart      rebuild and restart crawler"
 	@echo "  make clean        stop everything and remove all data"
+	@echo "  make k8s-up      build image, load into kind, apply manifests"
+	@echo "  make k8s-down    delete kind cluster"
+	@echo "  make k8s-verify  check pods, metrics, prometheus scrape"
 
 infra-start:
 	docker-compose up -d
@@ -80,3 +83,36 @@ clean:
 	-@pkill -x crawler
 	-docker exec gfap-redis-1 redis-cli FLUSHALL
 	docker-compose down -v
+
+.PHONY: k8s-up k8s-down k8s-verify
+
+k8s-up:
+	@which kind > /dev/null || { echo "kind not found: https://kind.sigs.k8s.io/docs/user/quick-start/#installation"; exit 1; }
+	@kind get clusters | grep -q gfap || kind create cluster --name gfap
+	docker build -t gfap-crawler:dev .
+	kind load docker-image gfap-crawler:dev --name gfap
+	kubectl apply -f k8s/namespace.yaml
+	@echo "Applying secret — ensure k8s/crawler-secret.yaml exists (copy from example and fill values)"
+	@test -f k8s/crawler-secret.yaml || { echo "ERROR: k8s/crawler-secret.yaml missing"; exit 1; }
+	kubectl apply -f k8s/crawler-secret.yaml
+	kubectl apply -k k8s/
+	kubectl rollout status deployment/gfap-crawler -n gfap --timeout=120s
+
+k8s-down:
+	kind delete cluster --name gfap
+
+k8s-verify:
+	@echo "--- pods ---"
+	kubectl get pods -n gfap
+	@echo "--- bloom init log ---"
+	kubectl logs -n gfap -l app=gfap-crawler -c bloom-init --tail=10
+	@echo "--- crawler metrics ---"
+	kubectl port-forward -n gfap svc/gfap-crawler 2112:2112 &
+	sleep 2
+	curl -s http://localhost:2112/metrics | grep -E "pages_processed|video_found|targets_found"
+	@kill %1 2>/dev/null || true
+	@echo "--- prometheus ---"
+	kubectl port-forward -n gfap svc/prometheus 9090:9090 &
+	sleep 2
+	curl -s http://localhost:9090/api/v1/targets | python3 -m json.tool | grep -A2 gfap-crawler
+	@kill %1 2>/dev/null || true

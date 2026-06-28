@@ -32,3 +32,6 @@ go.work.sum
 # Editor/IDE
 .idea/
 # .vscode/
+
+# real K8s secret
+k8s/crawler-secret.yaml
