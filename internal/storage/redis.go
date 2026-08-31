@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/redis/go-redis/v9"
@@ -12,7 +13,7 @@ const (
 	bloomKey    = "crawler:bloom"
 	overflowKey = "crawler:overflow"
 
-	bloomCapacity  = 1_000_000_000 // 3GB with 0.001% FPR
+	bloomCapacity  = 1_000_000_000 // ~2.8 GiB at 0.001% FPR
 	bloomErrorRate = 0.00001
 )
 
@@ -20,6 +21,7 @@ type Redis struct {
 	client *redis.Client
 }
 
+// NewRedis connects to addr on the default DB.
 func NewRedis(addr string) (*Redis, error) {
 	client := redis.NewClient(&redis.Options{Addr: addr})
 	if _, err := client.Ping(context.Background()).Result(); err != nil {
@@ -28,27 +30,69 @@ func NewRedis(addr string) (*Redis, error) {
 	return &Redis{client: client}, nil
 }
 
-// BloomInit reserves the Bloom filter with the config
+// Client exposes the raw client so storage.NewFrontier can share the connection.
+func (r *Redis) Client() *redis.Client { return r.client }
+
+// --- bloom filter ---
+
+// BloomInit reserves the filter NONSCALING if it doesn't exist yet - plain
+// BFReserve can't set that flag, and a scaling filter silently degrades FPR.
 func (r *Redis) BloomInit(ctx context.Context) error {
-	err := r.client.BFReserve(ctx, bloomKey, bloomErrorRate, bloomCapacity).Err()
+	err := r.client.BFReserveWithArgs(ctx, bloomKey, &redis.BFReserveOptions{
+		Capacity:   bloomCapacity,
+		Error:      bloomErrorRate,
+		NonScaling: true,
+	}).Err()
 	if err != nil && strings.Contains(err.Error(), "exists") {
-		// filter exists but still ensure AOF is on
-		return r.client.ConfigSet(ctx, "appendonly", "yes").Err()
+		return nil
 	}
+	return err
+}
+
+// BloomVerify checks capacity, sub-filter count, and implied FPR (a config
+// sanity check, not a runtime measurement) against the configured target.
+func (r *Redis) BloomVerify(ctx context.Context) error {
+	info, err := r.client.BFInfo(ctx, bloomKey).Result()
 	if err != nil {
-		return err
+		return fmt.Errorf("bloom filter missing or unreadable: %w", err)
 	}
-	// enable AOF persistence for Bloom
-	return r.client.ConfigSet(ctx, "appendonly", "yes").Err()
+	if info.Capacity != bloomCapacity {
+		return fmt.Errorf(
+			"bloom capacity is %d, want %d (auto-created default or stale reserve) - run: make reset-bloom",
+			info.Capacity, bloomCapacity)
+	}
+	if info.Filters > 1 {
+		return fmt.Errorf(
+			"bloom has scaled to %d sub-filters, FPR is degraded - run: make reset-bloom",
+			info.Filters)
+	}
+
+	bitsPerElement := float64(info.Size*8) / float64(info.Capacity)
+	impliedFPR := math.Pow(0.6185, bitsPerElement)
+	const tolerance = 2.0
+	if impliedFPR > bloomErrorRate*tolerance {
+		return fmt.Errorf(
+			"bloom implied FPR %.3e exceeds %.1fx tolerance of target %.3e - run: make reset-bloom",
+			impliedFPR, tolerance, bloomErrorRate)
+	}
+	return nil
 }
 
-// BloomAdd adds url to the Bloom filter
-// Returns true if newly inserted, false if already present
-func (r *Redis) BloomAdd(ctx context.Context, url string) (bool, error) {
-	return r.client.BFAdd(ctx, bloomKey, url).Result()
+// BloomFillRatio returns capacity used, for bloomMonitor's fill alerts.
+func (r *Redis) BloomFillRatio(ctx context.Context) (float64, error) {
+	info, err := r.client.BFInfo(ctx, bloomKey).Result()
+	if err != nil {
+		return 0, err
+	}
+	return float64(info.ItemsInserted) / float64(info.Capacity), nil
 }
 
-// BloomAddBatch pipelines BF.ADD for a slice of URLs - used by Resume() to re-seed from MongoDB
+// BloomAddBatch pipelines BF.ADD for a slice of URLs - rebuilds the filter
+// from Mongo after a Redis data-loss event. Callers must gate this on the
+// key having actually been missing at startup (BloomInit took the create
+// path, not the "exists" branch) or an explicit --rebuild-bloom flag - never
+// call it unconditionally, and never in response to a BloomVerify failure
+// (that's a config mismatch and must Stop() instead, not a data-loss signal).
 func (r *Redis) BloomAddBatch(ctx context.Context, urls []string) error {
 	pipe := r.client.Pipeline()
 	for _, url := range urls {
@@ -58,11 +102,9 @@ func (r *Redis) BloomAddBatch(ctx context.Context, urls []string) error {
 	return err
 }
 
-func (r *Redis) PushOverflow(ctx context.Context, url string) error {
-	return r.client.LPush(ctx, overflowKey, url).Err()
-}
-func (r *Redis) PopOverflow(ctx context.Context) (string, error) {
-	return r.client.RPop(ctx, overflowKey).Result()
+// BloomReset deletes only the bloom filter - frontier and Mongo untouched.
+func (r *Redis) BloomReset(ctx context.Context) error {
+	return r.client.Del(ctx, bloomKey).Err()
 }
 
 func (r *Redis) FlushDB(ctx context.Context) error {
@@ -73,23 +115,23 @@ func (r *Redis) Close() {
 	r.client.Close()
 }
 
+// --- superseded by frontier.go; still used by crawler.go until it moves
+// onto the frontier ---
+
+// BloomAdd adds url to the Bloom filter.
+// Returns true if newly inserted, false if already present.
+func (r *Redis) BloomAdd(ctx context.Context, url string) (bool, error) {
+	return r.client.BFAdd(ctx, bloomKey, url).Result()
+}
+
 func (r *Redis) BloomExists(ctx context.Context, url string) (bool, error) {
 	return r.client.BFExists(ctx, bloomKey, url).Result()
 }
 
-// BloomReset deletes only the bloom filter, not overflow or MongoDB
-func (r *Redis) BloomReset(ctx context.Context) error {
-	return r.client.Del(ctx, bloomKey).Err()
+func (r *Redis) PushOverflow(ctx context.Context, url string) error {
+	return r.client.LPush(ctx, overflowKey, url).Err()
 }
 
-// BloomVerify aborts startup if filter is missing or wrong capacity
-func (r *Redis) BloomVerify(ctx context.Context) error {
-	n, err := r.client.Exists(ctx, bloomKey).Result()
-	if err != nil {
-		return fmt.Errorf("[ERROR] Bloom verify failed: %v\n", err)
-	}
-	if n == 0 {
-		return fmt.Errorf("[ERROR] Bloom filter missing, run make reset-bloom or make infra-start\n")
-	}
-	return nil
+func (r *Redis) PopOverflow(ctx context.Context) (string, error) {
+	return r.client.RPop(ctx, overflowKey).Result()
 }
