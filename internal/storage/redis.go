@@ -10,8 +10,7 @@ import (
 )
 
 const (
-	bloomKey    = "crawler:bloom"
-	overflowKey = "crawler:overflow"
+	bloomKey = "crawler:bloom"
 
 	bloomCapacity  = 1_000_000_000 // ~2.8 GiB at 0.001% FPR
 	bloomErrorRate = 0.00001
@@ -37,16 +36,23 @@ func (r *Redis) Client() *redis.Client { return r.client }
 
 // BloomInit reserves the filter NONSCALING if it doesn't exist yet - plain
 // BFReserve can't set that flag, and a scaling filter silently degrades FPR.
-func (r *Redis) BloomInit(ctx context.Context) error {
-	err := r.client.BFReserveWithArgs(ctx, bloomKey, &redis.BFReserveOptions{
+// created reports whether this call actually created the key (false when it
+// already existed) - the caller's signal for whether a Bloom rebuild from
+// MongoDB is warranted, as opposed to a BloomVerify failure (config
+// mismatch, not data loss - that case must Stop(), not rebuild).
+func (r *Redis) BloomInit(ctx context.Context) (created bool, err error) {
+	err = r.client.BFReserveWithArgs(ctx, bloomKey, &redis.BFReserveOptions{
 		Capacity:   bloomCapacity,
 		Error:      bloomErrorRate,
 		NonScaling: true,
 	}).Err()
 	if err != nil && strings.Contains(err.Error(), "exists") {
-		return nil
+		return false, nil
 	}
-	return err
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // BloomVerify checks capacity, sub-filter count, and implied FPR (a config
@@ -113,25 +119,4 @@ func (r *Redis) FlushDB(ctx context.Context) error {
 
 func (r *Redis) Close() {
 	r.client.Close()
-}
-
-// --- superseded by frontier.go; still used by crawler.go until it moves
-// onto the frontier ---
-
-// BloomAdd adds url to the Bloom filter.
-// Returns true if newly inserted, false if already present.
-func (r *Redis) BloomAdd(ctx context.Context, url string) (bool, error) {
-	return r.client.BFAdd(ctx, bloomKey, url).Result()
-}
-
-func (r *Redis) BloomExists(ctx context.Context, url string) (bool, error) {
-	return r.client.BFExists(ctx, bloomKey, url).Result()
-}
-
-func (r *Redis) PushOverflow(ctx context.Context, url string) error {
-	return r.client.LPush(ctx, overflowKey, url).Err()
-}
-
-func (r *Redis) PopOverflow(ctx context.Context) (string, error) {
-	return r.client.RPop(ctx, overflowKey).Result()
 }

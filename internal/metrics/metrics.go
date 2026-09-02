@@ -27,12 +27,6 @@ var (
 		Name: "errors",
 		Help: "The total number of fetch errors",
 	})
-	// Superseded by FrontierReady/FrontierProcessing/FrontierDelayed below;
-	// still set by crawler.go until it moves onto the frontier.
-	QueueSize = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "queue_size",
-		Help: "Current number of URLs in flight",
-	})
 	FetchDuration = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "fetch_duration_seconds",
 		Help:    "HTTP fetch latency in seconds",

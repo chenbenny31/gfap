@@ -155,6 +155,11 @@ type Frontier interface {
 	AdmitVideo(ctx context.Context, url string) (AdmitResult, error)
 	AdmitListing(ctx context.Context, url string) (AdmitResult, error)
 
+	// SeedListing sets url due now (score 0) if it has no listing:next
+	// entry yet - NX so it never clobbers an existing schedule or an
+	// in-flight PENDING. For the startup re-seed of BaseUrl.
+	SeedListing(ctx context.Context, url string) error
+
 	Lease(ctx context.Context) (*Job, error) // nil, nil when frontier empty
 
 	Ack(ctx context.Context, j *Job) error
@@ -480,6 +485,10 @@ func (f *redisFrontier) AdmitListing(ctx context.Context, url string) (AdmitResu
 		return Suppressed, err
 	}
 	return AdmitResult(res), nil
+}
+
+func (f *redisFrontier) SeedListing(ctx context.Context, url string) error {
+	return f.client.ZAddNX(ctx, keyListingNext, redis.Z{Score: 0, Member: url}).Err()
 }
 
 // --- lease / completion ---

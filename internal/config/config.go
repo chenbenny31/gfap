@@ -10,8 +10,7 @@ import (
 )
 
 type Config struct {
-	Workers   int
-	QueueSize int
+	Workers int
 
 	BaseUrl      string
 	TestUrl      string
@@ -75,7 +74,6 @@ func Load() *Config {
 
 	return &Config{
 		Workers:          20, // ~0.5 req/s per each worker
-		QueueSize:        10_000,
 		BaseUrl:          "https://www.vidlii.com",
 		TestUrl:          "https://www.vidlii.com/user/rinkomania",
 		VideoPattern:     "/watch?v=",

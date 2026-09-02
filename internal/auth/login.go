@@ -1,11 +1,18 @@
 package auth
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"time"
 )
+
+// fetchTimeout bounds a single Get call - part of process()'s <60s hard
+// bound (worker.go), and what lets a cancelled context actually abort an
+// in-flight fetch instead of blocking shutdown indefinitely.
+const fetchTimeout = 30 * time.Second
 
 type Client struct {
 	*http.Client
@@ -23,6 +30,7 @@ func NewClient(jar http.CookieJar, proxyURL string) *Client {
 		Client: &http.Client{
 			Jar:       jar,
 			Transport: transport,
+			Timeout:   fetchTimeout,
 		},
 	}
 }
@@ -33,8 +41,8 @@ func NewJar() http.CookieJar {
 	return jar
 }
 
-func (c *Client) Get(url string) (*http.Response, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+func (c *Client) Get(ctx context.Context, url string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
