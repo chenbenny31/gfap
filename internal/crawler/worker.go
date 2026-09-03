@@ -310,6 +310,9 @@ func (c *Crawler) worker(ctx context.Context, workerID int, proxyURL string, sto
 			return
 		}
 
+		if c.debug {
+			log.Printf("[DEBUG] worker-%d leased job=%s url=%s", workerID, job.ID, job.URL)
+		}
 		out := c.process(ctx, job.URL, client)
 		c.handleOutcome(ctx, job, out, stopFn)
 	}
@@ -355,6 +358,9 @@ func (c *Crawler) workerTest(ctx context.Context, workerID int, stopFn func()) {
 			return
 		}
 
+		if c.debug {
+			log.Printf("[DEBUG] worker-%d leased job=%s url=%s", workerID, job.ID, job.URL)
+		}
 		out := c.process(ctx, job.URL, client)
 		c.handleOutcome(ctx, job, out, stopFn)
 	}

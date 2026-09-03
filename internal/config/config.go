@@ -73,13 +73,13 @@ func Load() *Config {
 	password := os.Getenv("VIDLII_PASSWORD")
 
 	return &Config{
-		Workers:          20, // ~0.5 req/s per each worker
+		Workers:          getEnvInt("WORKERS", 20),
 		BaseUrl:          "https://www.vidlii.com",
-		TestUrl:          "https://www.vidlii.com/user/rinkomania",
+		TestUrl:          getEnvStr("TEST_URL", "https://www.vidlii.com/user/rinkomania"),
 		VideoPattern:     "/watch?v=",
 		TitleSuffix:      " - VidLii",
 		OutputFile:       "targets.json",
-		RateLimit:        15 * time.Second,
+		RateLimit:        time.Duration(getEnvInt("RATE_LIMIT_SEC", 15)) * time.Second,
 		CutoffDate:       time.Date(2023, 12, 31, 23, 59, 59, 0, time.UTC),
 		RedisAddr:        redisAddr,
 		MongoURI:         mongoURI,
@@ -104,6 +104,13 @@ func Load() *Config {
 		ListingMaxTTLHours:     getEnvInt("LISTING_MAX_TTL_HOURS", 21*24),
 		QuarantineListingHours: getEnvInt("QUARANTINE_LISTING_HOURS", 7*24),
 	}
+}
+
+func getEnvStr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 func getEnvInt(key string, def int) int {

@@ -35,6 +35,40 @@ func (m *Mongo) Upsert(ctx context.Context, v model.Video) error {
 	return err
 }
 
+// EachVideoURL streams every stored video URL in batches, projecting only
+// _id so a corpus of millions never has to be decoded or held in full.
+func (m *Mongo) EachVideoURL(ctx context.Context, batch int, fn func([]string) error) error {
+	cursor, err := m.col.Find(ctx, bson.M{}, options.Find().SetProjection(bson.M{"_id": 1}))
+	if err != nil {
+		return err
+	}
+	defer cursor.Close(ctx)
+
+	urls := make([]string, 0, batch)
+	for cursor.Next(ctx) {
+		var doc struct {
+			URL string `bson:"_id"`
+		}
+		if err := cursor.Decode(&doc); err != nil {
+			return err
+		}
+		urls = append(urls, doc.URL)
+		if len(urls) >= batch {
+			if err := fn(urls); err != nil {
+				return err
+			}
+			urls = urls[:0]
+		}
+	}
+	if err := cursor.Err(); err != nil {
+		return err
+	}
+	if len(urls) > 0 {
+		return fn(urls)
+	}
+	return nil
+}
+
 func (m *Mongo) FindAll(ctx context.Context) ([]model.Video, error) {
 	cursor, err := m.col.Find(ctx, bson.M{})
 	if err != nil {

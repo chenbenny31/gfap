@@ -20,6 +20,15 @@ import (
 	"gfap/internal/storage"
 )
 
+// Redis DB indexes. Test mode is isolated from production so a test-mode
+// FlushDB cannot reach the live bloom filter or frontier.
+const (
+	prodRedisDB = 0
+	testRedisDB = 1
+
+	bloomReconcileBatch = 5000
+)
+
 func main() {
 	testMode := flag.Bool("test", false, "run bounded test crawl")
 	freshMode := flag.Bool("fresh", false, "first run: seed from seeds.txt")
@@ -39,7 +48,11 @@ func main() {
 		log.SetOutput(logFile)
 	}
 
-	redis, err := storage.NewRedis(cfg.RedisAddr)
+	redisDB := prodRedisDB
+	if *testMode {
+		redisDB = testRedisDB
+	}
+	redis, err := storage.NewRedis(cfg.RedisAddr, redisDB)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -94,8 +107,9 @@ func main() {
 		log.Fatalf("[ERROR] Bloom verify failed: %v\n", err)
 	}
 	if created {
-		rebuildBloomFromMongo(ctx, redis, mongo)
+		log.Println("[WARN] bloom filter was missing at startup - rebuilding from MongoDB")
 	}
+	reconcileBloomFromMongo(ctx, redis, mongo)
 	if err := frontier.SeedListing(ctx, cfg.BaseUrl); err != nil {
 		log.Fatalf("[ERROR] failed to seed listing schedule: %v\n", err)
 	}
@@ -146,21 +160,22 @@ func readSeedURLs(path, baseURL string) []string {
 	return urls
 }
 
-// rebuildBloomFromMongo re-adds every known video URL to a freshly-created
-// (i.e. previously missing) Bloom filter. Not run on ordinary restarts -
-// BloomInit's created result gates this to the actual data-loss case.
-func rebuildBloomFromMongo(ctx context.Context, redis *storage.Redis, mongo *storage.Mongo) {
-	log.Println("[WARN] bloom filter was missing at startup - rebuilding from MongoDB")
-	videos, err := mongo.FindAll(ctx)
+// reconcileBloomFromMongo re-adds every stored video URL to the filter.
+//
+// Runs on every startup, not only when the filter was missing. RDB snapshots
+// are taken a few times a day, so a crash restores a bloom that is stale
+// rather than absent - and the gap is exactly the videos MongoDB already
+// holds. BF.ADD is idempotent, so anything already present costs nothing.
+func reconcileBloomFromMongo(ctx context.Context, redis *storage.Redis, mongo *storage.Mongo) {
+	start := time.Now()
+	n := 0
+	err := mongo.EachVideoURL(ctx, bloomReconcileBatch, func(urls []string) error {
+		n += len(urls)
+		return redis.BloomAddBatch(ctx, urls)
+	})
 	if err != nil {
-		log.Fatalf("[ERROR] bloom rebuild: failed to read MongoDB: %v\n", err)
+		log.Fatalf("[ERROR] bloom reconcile failed after %d urls: %v\n", n, err)
 	}
-	ids := make([]string, len(videos))
-	for i, v := range videos {
-		ids[i] = v.URL
-	}
-	if err := redis.BloomAddBatch(ctx, ids); err != nil {
-		log.Fatalf("[ERROR] bloom rebuild failed: %v\n", err)
-	}
-	log.Printf("[INFO] bloom rebuilt from %d MongoDB documents\n", len(ids))
+	log.Printf("[INFO] bloom reconciled against %d MongoDB documents in %s\n",
+		n, time.Since(start).Round(time.Millisecond))
 }

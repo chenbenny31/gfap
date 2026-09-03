@@ -6,6 +6,7 @@ import (
 	"gfap/internal/auth"
 	"gfap/internal/config"
 	"gfap/internal/model"
+	"gfap/internal/scheduler"
 	"gfap/internal/storage"
 	"log"
 	"net/http"
@@ -15,7 +16,10 @@ import (
 	"time"
 )
 
-const maxTestVideos = 50 // test mode only
+const (
+	maxTestVideos = 5                // test mode only
+	testDeadline  = 15 * time.Minute // hard stop for a test run
+)
 
 type Crawler struct {
 	cfg      *config.Config
@@ -58,17 +62,18 @@ func (c *Crawler) TargetCount() int {
 // concern (gated on BloomInit's create-vs-exists result), not every resume.
 func (c *Crawler) Resume() {
 	ctx := context.Background()
-	videos, err := c.mongo.FindAll(ctx)
+	n, err := c.mongo.Count(ctx)
 	if err != nil {
 		log.Printf("[ERROR] Resume failed: %v\n", err)
 		return
 	}
-	for _, v := range videos {
-		if v.IsTarget {
-			c.targets = append(c.targets, v)
-		}
+	targets, err := c.mongo.FindTargets(ctx)
+	if err != nil {
+		log.Printf("[ERROR] Resume failed: %v\n", err)
+		return
 	}
-	c.count = len(videos)
+	c.targets = append(c.targets, targets...)
+	c.count = int(n)
 	log.Printf("[INFO] Resumed %d videos, %d targets\n", c.count, len(c.targets))
 }
 
@@ -138,11 +143,14 @@ func (c *Crawler) Login() error {
 
 // --- test only ---
 
-// RunTest drives a bounded crawl from seedURL until maxTestVideos videos are
-// found or the frontier goes idle, whichever comes first.
+// RunTest drives a bounded crawl from seedURL, stopping at maxTestVideos, an
+// idle frontier, or testDeadline - whichever comes first. The reconcilers run
+// here too: without the promoter, a job that Fails into DELAYED would never
+// come back, and since Idle() counts DELAYED the run would neither finish nor
+// go idle.
 func (c *Crawler) RunTest(seedURL string) {
 	c.debug = true
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), testDeadline)
 	defer cancel()
 
 	if _, err := c.admitURL(ctx, seedURL); err != nil {
@@ -151,6 +159,7 @@ func (c *Crawler) RunTest(seedURL string) {
 	}
 
 	var wg sync.WaitGroup
+	scheduler.Run(ctx, c.frontier, c.redis, c.cfg.SchedulerBatchLimit, cancel, &wg)
 	for i := 0; i < c.cfg.Workers; i++ {
 		wg.Add(1)
 		go func(workerID int) {
@@ -161,7 +170,7 @@ func (c *Crawler) RunTest(seedURL string) {
 		}(i)
 	}
 
-	for c.Count() < maxTestVideos {
+	for c.Count() < maxTestVideos && ctx.Err() == nil {
 		if idle, err := c.frontier.Idle(ctx); err != nil || idle {
 			break
 		}
