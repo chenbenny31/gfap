@@ -1,12 +1,13 @@
 METRICS_PORT = 2112
 BINARY = ./crawler
 
-.PHONY: help infra-start infra-stop infra-logs build fresh resume test stop metrics logs reset-bloom
+.PHONY: help infra-start infra-stop infra-logs build fresh resume test stop metrics logs reset-bloom snapshot
 
 help:
 	@echo "gfap — commands:"
 	@echo "  make infra-start  start Docker services (Redis/MongoDB/Prometheus)"
-	@echo "  make infra-stop   stop Docker services"
+	@echo "  make infra-stop   snapshot redis, then stop Docker services"
+	@echo "  make snapshot     force a redis RDB snapshot now"
 	@echo "  make infra-logs   log Docker services"
 	@echo "  make build        build crawler binary"
 	@echo "  make fresh        first run — drops corpus, seeds from seeds.txt"
@@ -31,8 +32,16 @@ infra-start:
 	@echo "Prometheus: http://localhost:9090"
 	@echo "Metrics: http://localhost:$(METRICS_PORT)/metrics"
 
-infra-stop:
+# Automatic save points are disabled (see docker-compose.yml), and that also
+# means redis does NOT save on clean shutdown - snapshot before stopping.
+infra-stop: snapshot
 	docker-compose down
+
+snapshot:
+	@docker exec gfap-redis-1 redis-cli BGSAVE
+	@echo "waiting for rdb..."
+	@until [ "$$(docker exec gfap-redis-1 redis-cli INFO persistence | grep -c 'rdb_bgsave_in_progress:0')" = "1" ]; do sleep 1; done
+	@docker exec gfap-redis-1 redis-cli INFO persistence | grep -E "rdb_last_bgsave_status|rdb_last_save_time"
 
 infra-logs:
 	docker-compose logs -f

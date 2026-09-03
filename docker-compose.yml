@@ -1,8 +1,22 @@
 services:
   redis:
     image: redis/redis-stack:latest
+    # Persistence is tuned for a large, mostly-static bloom filter on a VPS
+    # with a fair-share disk-I/O policy. The stock rule set (save 60 10000)
+    # triggers a full RDB every minute during a crawl - every admission counts
+    # as a changed key - and each RDB re-serializes the whole ~2.9 GB filter
+    # (~300 MB compressed at 5M videos). That is hundreds of GB/day of writes
+    # to persist a structure whose bits are only ever set.
+    #
+    # maxmemory is a guard rail, not a cache policy: nothing here is evictable
+    # (you cannot drop entries from a bloom), so noeviction turns an overrun
+    # into an explicit BF.ADD error, which the worker escalates to a clean
+    # Stop() instead of the kernel OOM-killing redis and taking the frontier.
     environment:
-      - REDIS_ARGS=--appendonly yes
+      # Default suits one production filter (~2.9 GB) plus frontier headroom on
+      # an 8 GB host. Raise it when running test mode on the same instance:
+      # test mode reserves a second filter of equal size in its own DB.
+      - REDIS_ARGS=--appendonly no --save "" --maxmemory ${REDIS_MAXMEMORY:-4500mb} --maxmemory-policy noeviction
     ports:
       - "6379:6379"
     volumes:
@@ -11,6 +25,11 @@ services:
 
   mongo:
     image: mongo:7
+    # WiredTiger defaults to (RAM-1GB)/2 = 3.5 GB on an 8 GB host, which
+    # collides with redis holding the bloom resident. Mongo degrades
+    # gracefully under a smaller cache (a miss is a disk read); the bloom
+    # cannot be paged out without destroying admission throughput.
+    command: ["--wiredTigerCacheSizeGB", "1.5"]
     ports:
       - "27017:27017"
     volumes:
@@ -27,6 +46,7 @@ services:
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=7d'
     restart: unless-stopped
 
 volumes:
