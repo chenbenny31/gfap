@@ -2,17 +2,89 @@ package storage
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"time"
 
 	"gfap/internal/model"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/mongo/readpref"
 )
 
 type Mongo struct {
 	client *mongo.Client
 	col    *mongo.Collection
+}
+
+// RequireEmptyMongoForTest checks every collection before a fresh test starts.
+// It creates no indexes and changes no data. The caller must have exclusive
+// use of the database; this check is not a lock against concurrent writers.
+func RequireEmptyMongoForTest(ctx context.Context, uri, dbName string) (err error) {
+	switch dbName {
+	case "", "admin", "config", "local":
+		return fmt.Errorf("test preflight: invalid application database %q", dbName)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	client, err := mongo.Connect(ctx, options.Client().
+		ApplyURI(uri).SetReadPreference(readpref.Primary()))
+	if err != nil {
+		return fmt.Errorf("test preflight: connect to Mongo: %w", err)
+	}
+	defer func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer closeCancel()
+		if closeErr := client.Disconnect(closeCtx); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("test preflight: disconnect Mongo: %w", closeErr))
+		}
+	}()
+
+	db := client.Database(dbName)
+	collections, err := db.ListCollections(ctx, bson.D{},
+		options.ListCollections().SetNameOnly(true))
+	if err != nil {
+		return fmt.Errorf("test preflight: list Mongo collections: %w", err)
+	}
+	defer func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer closeCancel()
+		if closeErr := collections.Close(closeCtx); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("test preflight: close collection cursor: %w", closeErr))
+		}
+	}()
+
+	for collections.Next(ctx) {
+		var collection struct {
+			Name string `bson:"name"`
+		}
+		if err := collections.Decode(&collection); err != nil {
+			return fmt.Errorf("test preflight: decode collection name: %w", err)
+		}
+		if collection.Name == "" {
+			return errors.New("test preflight: collection name is missing")
+		}
+
+		queryErr := db.Collection(collection.Name).FindOne(ctx, bson.D{},
+			options.FindOne().SetProjection(bson.M{"_id": 1})).Err()
+		switch {
+		case errors.Is(queryErr, mongo.ErrNoDocuments):
+			continue
+		case queryErr != nil:
+			return fmt.Errorf("test preflight: inspect %s.%s: %w", dbName, collection.Name, queryErr)
+		default:
+			return fmt.Errorf("test refused: Mongo database %q contains documents in collection %q",
+				dbName, collection.Name)
+		}
+	}
+	if err := collections.Err(); err != nil {
+		return fmt.Errorf("test preflight: read collection cursor: %w", err)
+	}
+	return ctx.Err()
 }
 
 func NewMongo(uri, db, col string) (*Mongo, error) {

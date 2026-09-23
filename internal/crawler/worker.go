@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,8 +27,10 @@ const (
 	// Fail/Terminal/CompleteListing), independent of the worker's root
 	// context - a slow Mongo call or a cancelled root ctx must never
 	// prevent a leased job from being released.
-	completionTimeout = 3 * time.Second
-	workerIdleSleep   = 1 * time.Second
+	completionTimeout   = 3 * time.Second
+	workerIdleSleep     = 1 * time.Second
+	proxyWarningEvery   = 5
+	workerRateLimitStop = 5
 )
 
 type pageKind int
@@ -45,7 +48,7 @@ type pageOutcome struct {
 	kind      pageKind
 	video     model.Video       // pageVideo
 	links     []string          // pageVideo, pageListing
-	reason    string            // pageNotFound
+	reason    string            // HTTP status or fixed failure label; never raw errors
 	failClass storage.FailClass // pageRetryable
 }
 
@@ -150,6 +153,20 @@ func extractLinks(doc *goquery.Document, baseURL string) []string {
 	return links
 }
 
+// isRateLimitTitle preserves the existing title check and recognizes common
+// variants. Do not scan arbitrary body text: normal content can mention limits.
+func isRateLimitTitle(title string) bool {
+	title = strings.ToLower(strings.Join(strings.Fields(title), " "))
+	for _, phrase := range []string{
+		"rate limited", "rate limiting", "rate limit exceeded", "too many requests",
+	} {
+		if strings.Contains(title, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
 // process fetches and classifies url in a single attempt - no in-process
 // retry or backoff. All retry timing lives in the frontier's backoff
 // ladders (Fail's RateLimitBackoff/StrikeBackoff), driven by whatever
@@ -162,28 +179,43 @@ func (c *Crawler) process(ctx context.Context, url string, client *auth.Client) 
 		if ctx.Err() != nil {
 			return pageOutcome{kind: pageCancelled}
 		}
-		return pageOutcome{kind: pageRetryable, failClass: storage.FailStrikeable}
+		return pageOutcome{
+			kind: pageRetryable, failClass: storage.FailStrikeable,
+			reason: "request_failed",
+		}
 	}
 	defer resp.Body.Close()
 
 	switch resp.StatusCode {
 	case http.StatusTooManyRequests:
-		return pageOutcome{kind: pageRetryable, failClass: storage.FailRateLimited}
+		return pageOutcome{
+			kind: pageRetryable, failClass: storage.FailRateLimited,
+			reason: "http_429",
+		}
 	case http.StatusNotFound, http.StatusGone:
 		return pageOutcome{kind: pageNotFound, reason: strconv.Itoa(resp.StatusCode)}
 	case http.StatusOK:
 		// falls through to parsing below
 	default:
-		return pageOutcome{kind: pageRetryable, failClass: storage.FailStrikeable}
+		return pageOutcome{
+			kind: pageRetryable, failClass: storage.FailStrikeable,
+			reason: "http_" + strconv.Itoa(resp.StatusCode),
+		}
 	}
 
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
-		return pageOutcome{kind: pageUnknown}
+		if ctx.Err() != nil {
+			return pageOutcome{kind: pageCancelled}
+		}
+		return pageOutcome{kind: pageUnknown, reason: "parse_failed"}
 	}
 	title := doc.Find("title").Text()
-	if strings.Contains(title, "Rate Limited") {
-		return pageOutcome{kind: pageRetryable, failClass: storage.FailRateLimited}
+	if isRateLimitTitle(title) {
+		return pageOutcome{
+			kind: pageRetryable, failClass: storage.FailRateLimited,
+			reason: "http_200_rate_limit_title",
+		}
 	}
 
 	metrics.PagesProcessed.Inc()
@@ -230,26 +262,27 @@ func (c *Crawler) recordVideo(v model.Video) {
 
 // handleOutcome resolves the leased job per out.kind - the switch in §7's
 // worker loop, factored out so both worker() and workerTest() share it.
-func (c *Crawler) handleOutcome(ctx context.Context, job *storage.Job, out pageOutcome, stopFn func()) {
+func (c *Crawler) handleOutcome(ctx context.Context, job *storage.Job, out pageOutcome, stopFn func()) bool {
 	switch out.kind {
 	case pageVideo:
 		if err := c.mongo.Upsert(ctx, out.video); err != nil {
 			c.resolve(func(fctx context.Context) error { return c.frontier.Nack(fctx, job) })
-			return
+			return false
 		}
 		c.recordVideo(out.video)
 		if _, err := c.enqueueChildren(ctx, out.links); err != nil {
 			c.resolve(func(fctx context.Context) error { return c.frontier.Nack(fctx, job) })
 			maybeFatalAdmission(err, stopFn)
-			return
+			return false
 		}
 		c.resolve(func(fctx context.Context) error { return c.frontier.Ack(fctx, job) })
+		return true
 	case pageListing:
 		n, err := c.enqueueChildren(ctx, out.links)
 		if err != nil {
 			c.resolve(func(fctx context.Context) error { return c.frontier.Nack(fctx, job) })
 			maybeFatalAdmission(err, stopFn)
-			return
+			return false
 		}
 		c.resolve(func(fctx context.Context) error { return c.frontier.CompleteListing(fctx, job, n) })
 	case pageNotFound:
@@ -270,6 +303,7 @@ func (c *Crawler) handleOutcome(ctx context.Context, job *storage.Job, out pageO
 	case pageCancelled:
 		c.resolve(func(fctx context.Context) error { return c.frontier.Nack(fctx, job) })
 	}
+	return false
 }
 
 // sleepCtx sleeps for d or returns early if ctx is cancelled - used for the
@@ -281,16 +315,66 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 	}
 }
 
+// workerFailures belongs to one worker and its fixed proxy assignment.
+// It observes fetch/parse outcomes only, not Mongo or Redis failures.
+type workerFailures struct {
+	consecutive            int
+	rateLimited            int
+	consecutiveRateLimited int
+}
+
+func (f *workerFailures) observe(workerID int, route string, out pageOutcome) {
+	if out.kind != pageCancelled {
+		if out.kind == pageRetryable && out.failClass == storage.FailRateLimited {
+			f.consecutiveRateLimited++
+		} else {
+			f.consecutiveRateLimited = 0
+		}
+	}
+	switch out.kind {
+	case pageCancelled:
+		return
+	case pageVideo, pageListing, pageNotFound:
+		f.consecutive = 0
+		f.rateLimited = 0
+		return
+	case pageRetryable, pageUnknown:
+		f.consecutive++
+		if out.kind == pageRetryable && out.failClass == storage.FailRateLimited {
+			f.rateLimited++
+		}
+	}
+	if f.consecutive > 0 && f.consecutive%proxyWarningEvery == 0 {
+		log.Printf("[WARN] worker=%d route=%s consecutive_failures=%d rate_limited=%d last_reason=%s suspected_proxy_network_or_site_problem=true",
+			workerID, route, f.consecutive, f.rateLimited, out.reason)
+	}
+}
+
 // --- production ---
 
 func (c *Crawler) worker(ctx context.Context, workerID int, proxyURL string, stopFn func(), wg *sync.WaitGroup) {
 	defer wg.Done()
-	time.Sleep(time.Duration(workerID) * c.cfg.RateLimit / time.Duration(c.cfg.Workers)) // startup jitter
+	sleepCtx(ctx, time.Duration(workerID)*c.cfg.RateLimit/time.Duration(c.cfg.Workers))
+	c.workerLoop(ctx, workerID, proxyURL, stopFn, 0)
+}
+
+// workerLoop is shared by production and the bounded parsing test.
+// videoLimit == 0 means production has no video-count stop condition.
+func (c *Crawler) workerLoop(ctx context.Context, workerID int, proxyURL string, stopFn func(), videoLimit int) {
+	if ctx.Err() != nil {
+		return
+	}
+	route := "direct"
+	if proxyURL != "" {
+		route = "proxy_slot_" + strconv.Itoa(workerID)
+	}
+	var failures workerFailures
 	client := auth.NewClient(c.jar, proxyURL)
+	defer client.CloseIdleConnections()
 	limiter := rate.NewLimiter(rate.Every(c.cfg.RateLimit), 1)
 
 	for {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || (videoLimit > 0 && c.Count() >= videoLimit) {
 			return
 		}
 
@@ -311,25 +395,57 @@ func (c *Crawler) worker(ctx context.Context, workerID int, proxyURL string, sto
 		}
 
 		if c.debug {
-			log.Printf("[DEBUG] worker-%d leased job=%s url=%s", workerID, job.ID, job.URL)
+			c.recordTestStart(job.URL)
+			log.Printf("[DEBUG] event=process_start pid=%d worker=%d route=%s job=%q url=%q at_ns=%d",
+				os.Getpid(), workerID, route, job.ID, job.URL, time.Now().UnixNano())
 		}
 		out := c.process(ctx, job.URL, client)
-		c.handleOutcome(ctx, job, out, stopFn)
+		if c.debug {
+			c.recordTestFinish(workerID, job.URL, out.kind)
+			log.Printf("[DEBUG] event=process_finish pid=%d worker=%d route=%s job=%q url=%q at_ns=%d kind=%d reason=%q",
+				os.Getpid(), workerID, route, job.ID, job.URL, time.Now().UnixNano(), out.kind, out.reason)
+		}
+		failures.observe(workerID, route, out)
+		stored := c.handleOutcome(ctx, job, out, stopFn)
+		if c.debug && stored {
+			c.mu.Lock()
+			c.testStored[workerID]++
+			c.mu.Unlock()
+		}
+		if failures.consecutiveRateLimited >= workerRateLimitStop {
+			log.Printf("[ERROR] worker=%d route=%s stopping after %d consecutive rate limits; last_reason=%s",
+				workerID, route, failures.consecutiveRateLimited, out.reason)
+			if c.debug {
+				c.mu.Lock()
+				c.testRetired[workerID] = true
+				c.mu.Unlock()
+			}
+			return
+		}
 	}
 }
 
-// Run spawns cfg.Workers worker goroutines on wg and returns immediately;
-// callers wait via wg.Wait() (shared with scheduler.Run's reconcilers)
-// after ctx is cancelled elsewhere.
+// Run starts workers and registers their supervisor on the shared WaitGroup.
+// When every worker exits, cancel the root context so reconcilers also stop.
 func (c *Crawler) Run(ctx context.Context, stopFn func(), wg *sync.WaitGroup) {
+	var workers sync.WaitGroup
+	wg.Add(1)
 	for i := 0; i < c.cfg.Workers; i++ {
 		proxyURL := ""
 		if i < len(c.cfg.StaticProxyURLs) {
 			proxyURL = c.cfg.StaticProxyURLs[i]
 		}
-		wg.Add(1)
-		go c.worker(ctx, i, proxyURL, stopFn, wg)
+		workers.Add(1)
+		go c.worker(ctx, i, proxyURL, stopFn, &workers)
 	}
+	go func() {
+		defer wg.Done()
+		workers.Wait()
+		if ctx.Err() == nil {
+			log.Print("[ERROR] All workers stopped; shutting down crawler")
+		}
+		stopFn()
+	}()
 }
 
 // --- test only ---
@@ -339,29 +455,5 @@ func (c *Crawler) workerTest(ctx context.Context, workerID int, stopFn func()) {
 	if workerID < len(c.cfg.StaticProxyURLs) {
 		proxyURL = c.cfg.StaticProxyURLs[workerID]
 	}
-	client := auth.NewClient(c.jar, proxyURL)
-	limiter := rate.NewLimiter(rate.Every(c.cfg.RateLimit), 1)
-
-	for {
-		if ctx.Err() != nil || c.Count() >= maxTestVideos {
-			return
-		}
-
-		job, err := c.frontier.Lease(ctx)
-		if err != nil || job == nil {
-			sleepCtx(ctx, workerIdleSleep)
-			continue
-		}
-
-		if err := limiter.Wait(ctx); err != nil {
-			c.resolve(func(fctx context.Context) error { return c.frontier.Nack(fctx, job) })
-			return
-		}
-
-		if c.debug {
-			log.Printf("[DEBUG] worker-%d leased job=%s url=%s", workerID, job.ID, job.URL)
-		}
-		out := c.process(ctx, job.URL, client)
-		c.handleOutcome(ctx, job, out, stopFn)
-	}
+	c.workerLoop(ctx, workerID, proxyURL, stopFn, maxTestVideos)
 }

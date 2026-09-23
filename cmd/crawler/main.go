@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"gfap/internal/metrics"
 	"gfap/internal/scheduler"
 	"io"
 	"log"
+	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -34,9 +37,37 @@ func main() {
 	freshMode := flag.Bool("fresh", false, "first run: seed from seeds.txt")
 	flag.Parse()
 
-	cfg := config.Load()
+	var cfg *config.Config
+	if *testMode {
+		cfg = config.LoadTest()
+	} else {
+		cfg = config.Load()
 
-	logFile, err := os.OpenFile("crawler.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+		_, redisPort, err := net.SplitHostPort(cfg.RedisAddr)
+		if err != nil {
+			log.Fatal("invalid production Redis address")
+		}
+		if strings.TrimLeft(redisPort, "0") == "16379" || cfg.MongoDB == "gfap_test" {
+			log.Fatal("production cannot use test storage")
+		}
+
+		mongoURI, err := url.Parse(cfg.MongoURI)
+		if err != nil || mongoURI.Host == "" {
+			log.Fatal("invalid production Mongo URI")
+		}
+		for _, host := range strings.Split(mongoURI.Host, ",") {
+			_, port, err := net.SplitHostPort(host)
+			if err == nil && strings.TrimLeft(port, "0") == "37017" {
+				log.Fatal("production cannot use the test Mongo port")
+			}
+		}
+	}
+
+	logPath := "crawler.log"
+	if *testMode {
+		logPath = "crawler.test.log"
+	}
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
 		log.Fatalf("error opening file: %v", err)
 	}
@@ -85,13 +116,41 @@ func main() {
 
 	if *testMode {
 		log.Println("[INFO] Running in test mode")
-		c.InitTest()
+		if err := c.InitTest(ctx); err != nil {
+			log.Fatalf("[ERROR] Test initialization failed: %v", err)
+		}
 		if _, err := redis.BloomInit(ctx); err != nil { // Bloom needed after InitTest's FlushDB
 			log.Fatalf("[ERROR] Bloom init failed: %v\n", err)
 		}
-		c.RunTest(cfg.TestUrl)
-		if err := c.SaveTest(); err != nil {
-			log.Printf("[ERROR] Failed to save crawler data: %v", err)
+		if err := redis.BloomVerify(ctx); err != nil {
+			log.Fatalf("[ERROR] Test Bloom verification failed: %v", err)
+		}
+		crawlState, err := storage.NewCrawlStateStore(ctx, redis, mongo)
+		if err != nil {
+			log.Fatalf("[ERROR] Test crawl state initialization failed: %v", err)
+		}
+		restored, err := crawlState.Restore(ctx)
+		if err != nil {
+			log.Fatalf("[ERROR] Test crawl state restore failed: %v", err)
+		}
+		log.Printf("[INFO] Test crawl state startup: mode=%s rows=%d", restored.Mode, restored.Rows)
+
+		crawlErr := c.RunTest(ctx, cfg.TestUrl)
+		// RunTest has joined all workers and reconcilers. Save the final
+		// state even if the crawl failed or its parent was cancelled.
+		saveCtx, saveCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		stats, checkpointErr := crawlState.Checkpoint(saveCtx)
+		saveCancel()
+		if checkpointErr != nil {
+			checkpointErr = fmt.Errorf("test final checkpoint: %w", checkpointErr)
+		} else {
+			log.Printf("[INFO] Test final checkpoint complete: %+v", stats)
+		}
+		if err := errors.Join(crawlErr, checkpointErr, ctx.Err()); err != nil {
+			log.Fatalf("[ERROR] Test failed: %v", err)
+		}
+		if err := c.SaveTest(ctx); err != nil {
+			log.Fatalf("[ERROR] Failed to save test results: %v", err)
 		}
 		res := fmt.Sprintf("Visited %d videos, target %d\n", c.Count(), c.TargetCount())
 		log.Print(res)
@@ -110,6 +169,15 @@ func main() {
 		log.Println("[WARN] bloom filter was missing at startup - rebuilding from MongoDB")
 	}
 	reconcileBloomFromMongo(ctx, redis, mongo)
+	crawlState, err := storage.NewCrawlStateStore(ctx, redis, mongo)
+	if err != nil {
+		log.Fatalf("[ERROR] crawl state initialization failed: %v\n", err)
+	}
+	restored, err := crawlState.Restore(ctx)
+	if err != nil {
+		log.Fatalf("[ERROR] crawl state restore failed: %v\n", err)
+	}
+	log.Printf("[INFO] crawl state startup: mode=%s rows=%d\n", restored.Mode, restored.Rows)
 	if err := frontier.SeedListing(ctx, cfg.BaseUrl); err != nil {
 		log.Fatalf("[ERROR] failed to seed listing schedule: %v\n", err)
 	}
@@ -122,6 +190,7 @@ func main() {
 
 	var wg sync.WaitGroup
 	scheduler.Run(ctx, frontier, redis, cfg.SchedulerBatchLimit, cancel, &wg)
+	scheduler.RunCrawlStateCheckpoint(ctx, crawlState, &wg)
 	c.Run(ctx, cancel, &wg)
 	<-ctx.Done()
 	wg.Wait()

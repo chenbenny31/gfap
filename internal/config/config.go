@@ -106,6 +106,22 @@ func Load() *Config {
 	}
 }
 
+// LoadTest uses fixed endpoints for the separate test containers.
+// Production storage environment variables cannot redirect a test run.
+func LoadTest() *Config {
+	cfg := Load()
+	cfg.RedisAddr = "127.0.0.1:16379"
+	cfg.MongoURI = "mongodb://127.0.0.1:37017"
+	cfg.MongoDB = "gfap_test"
+	cfg.MetricsPort = "2113"
+	cfg.OutputFile = "targets.test.json"
+	cfg.Workers = 100
+	if cfg.RateLimit < 30*time.Second {
+		cfg.RateLimit = 30 * time.Second
+	}
+	return cfg
+}
+
 func getEnvStr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

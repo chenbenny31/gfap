@@ -3,6 +3,8 @@ package crawler
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"gfap/internal/auth"
 	"gfap/internal/config"
 	"gfap/internal/model"
@@ -17,8 +19,8 @@ import (
 )
 
 const (
-	maxTestVideos = 5                // test mode only
-	testDeadline  = 15 * time.Minute // hard stop for a test run
+	maxTestVideos = 200             // test mode only
+	testDeadline  = 2 * time.Minute // hard stop for a test run
 )
 
 type Crawler struct {
@@ -31,8 +33,14 @@ type Crawler struct {
 	mu       sync.Mutex
 	count    int
 
-	// test only
-	debug bool
+	// test only; observations are protected by mu
+	debug        bool
+	testActive   map[string]int
+	testParsed   []int
+	testErr      error
+	testStored   []int
+	testRetired  []bool
+	testFinished int
 }
 
 func New(cfg *config.Config, redis *storage.Redis, mongo *storage.Mongo, frontier storage.Frontier) *Crawler {
@@ -143,19 +151,47 @@ func (c *Crawler) Login() error {
 
 // --- test only ---
 
-// RunTest drives a bounded crawl from seedURL, stopping at maxTestVideos, an
-// idle frontier, or testDeadline - whichever comes first. The reconcilers run
-// here too: without the promoter, a job that Fails into DELAYED would never
-// come back, and since Idle() counts DELAYED the run would neither finish nor
-// go idle.
-func (c *Crawler) RunTest(seedURL string) {
+// RunTest performs the bounded parsing phase. It returns an error if the
+// phase is cancelled, times out, or drains before reaching its video target.
+// Workers and reconcilers are stopped and joined before it returns.
+func (c *Crawler) RunTest(parent context.Context, seedURL string) error {
+	if c.cfg.Workers < 2 {
+		return errors.New("test requires at least two workers")
+	}
+	if c.cfg.RateLimit < 30*time.Second {
+		return errors.New("test requires at least 30 seconds between worker requests")
+	}
+	for i := 0; i < c.cfg.Workers; i++ {
+		if i >= len(c.cfg.StaticProxyURLs) || strings.TrimSpace(c.cfg.StaticProxyURLs[i]) == "" {
+			return fmt.Errorf("test worker %d has no proxy", i)
+		}
+	}
+
 	c.debug = true
-	ctx, cancel := context.WithTimeout(context.Background(), testDeadline)
+	c.mu.Lock()
+	c.testActive = make(map[string]int)
+	c.testParsed = make([]int, c.cfg.Workers)
+	c.testErr = nil
+	c.testStored = make([]int, c.cfg.Workers)
+	c.testRetired = make([]bool, c.cfg.Workers)
+	c.testFinished = 0
+	c.mu.Unlock()
+	ctx, cancel := context.WithTimeout(parent, testDeadline)
 	defer cancel()
 
-	if _, err := c.admitURL(ctx, seedURL); err != nil {
-		log.Printf("[ERROR] RunTest: seed admission failed: %v\n", err)
-		return
+	admitted, err := c.admitURL(ctx, seedURL)
+	if err != nil {
+		return fmt.Errorf("test seed admission: %w", err)
+	}
+	if admitted == storage.Suppressed {
+		return errors.New("test seed was not admitted")
+	}
+	duplicate, err := c.admitURL(ctx, seedURL)
+	if err != nil {
+		return fmt.Errorf("test duplicate seed admission: %w", err)
+	}
+	if duplicate != storage.Suppressed {
+		return errors.New("test duplicate seed was admitted twice")
 	}
 
 	var wg sync.WaitGroup
@@ -163,26 +199,130 @@ func (c *Crawler) RunTest(seedURL string) {
 	for i := 0; i < c.cfg.Workers; i++ {
 		wg.Add(1)
 		go func(workerID int) {
-			defer wg.Done()
+			defer func() {
+				c.mu.Lock()
+				c.testFinished++
+				c.mu.Unlock()
+				wg.Done()
+			}()
 			offset := time.Duration(workerID) * c.cfg.RateLimit / time.Duration(c.cfg.Workers)
-			time.Sleep(offset)
+			sleepCtx(ctx, offset)
+			if ctx.Err() != nil {
+				return
+			}
 			c.workerTest(ctx, workerID, cancel)
 		}(i)
 	}
 
-	for c.Count() < maxTestVideos && ctx.Err() == nil {
-		if idle, err := c.frontier.Idle(ctx); err != nil || idle {
+	var runErr error
+	for c.Count() < maxTestVideos {
+		if c.hasTestFailure() {
 			break
 		}
-		time.Sleep(100 * time.Millisecond)
+		c.mu.Lock()
+		finished := c.testFinished
+		c.mu.Unlock()
+		if finished == c.cfg.Workers {
+			if c.Count() < maxTestVideos {
+				runErr = errors.New("all test workers stopped before reaching the video target")
+			}
+			break
+		}
+		if ctx.Err() != nil {
+			runErr = ctx.Err()
+			break
+		}
+		idle, err := c.frontier.Idle(ctx)
+		if err != nil {
+			runErr = fmt.Errorf("test frontier inspection: %w", err)
+			break
+		}
+		if idle {
+			if count := c.Count(); count < maxTestVideos {
+				runErr = fmt.Errorf("test frontier drained after %d videos; need %d", count, maxTestVideos)
+			}
+			break
+		}
+		sleepCtx(ctx, 100*time.Millisecond)
+	}
+	if runErr == nil {
+		runErr = ctx.Err()
 	}
 	cancel()
 	wg.Wait()
-	log.Printf("[INFO] Test finished - %d videos, %d targets\n", c.Count(), c.TargetCount())
+
+	if err := errors.Join(runErr, parent.Err(), c.validateTestWorkers()); err != nil {
+		return err
+	}
+	verifyCtx, verifyCancel := context.WithTimeout(parent, 30*time.Second)
+	defer verifyCancel()
+	stored, err := c.mongo.Count(verifyCtx)
+	if err != nil {
+		return fmt.Errorf("test Mongo verification: %w", err)
+	}
+	if stored < maxTestVideos || stored != int64(c.Count()) {
+		return fmt.Errorf("test stored %d unique videos for %d recorded writes; need at least %d",
+			stored, c.Count(), maxTestVideos)
+	}
+	log.Printf("[INFO] Bounded crawl complete - %d videos, %d targets\n", c.Count(), c.TargetCount())
+	return nil
 }
 
-func (c *Crawler) SaveTest() error {
-	ctx := context.Background()
+// Test observations use the existing mutex and never change frontier decisions.
+func (c *Crawler) recordTestStart(url string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.testActive[url] > 0 && c.testErr == nil {
+		c.testErr = fmt.Errorf("test detected concurrent processing of %q", url)
+	}
+	c.testActive[url]++
+}
+
+func (c *Crawler) recordTestFinish(workerID int, url string, kind pageKind) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.testActive[url]--
+	if c.testActive[url] == 0 {
+		delete(c.testActive, url)
+	}
+	if kind == pageVideo || kind == pageListing {
+		c.testParsed[workerID]++
+	}
+}
+
+func (c *Crawler) hasTestFailure() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.testErr != nil
+}
+
+func (c *Crawler) validateTestWorkers() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	result := c.testErr
+	if len(c.testActive) != 0 {
+		result = errors.Join(result, errors.New("test finished with unfinished processing observations"))
+	}
+	for workerID, parsed := range c.testParsed {
+		status := "video_stored"
+		switch {
+		case c.testRetired[workerID]:
+			status = "rate_limited"
+			result = errors.Join(result, fmt.Errorf("test worker %d stopped after consecutive rate limits", workerID))
+		case c.testStored[workerID] == 0:
+			status = "unverified"
+			result = errors.Join(result, fmt.Errorf("test worker %d did not store a video", workerID))
+		}
+		log.Printf("[INFO] Test worker=%d proxy_slot=%d parsed_pages=%d stored_videos=%d result=%s",
+			workerID, workerID, parsed, c.testStored[workerID], status)
+	}
+	return result
+}
+
+func (c *Crawler) SaveTest(parent context.Context) (err error) {
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+
 	targets, err := c.mongo.FindTargets(ctx)
 	if err != nil {
 		return err
@@ -191,14 +331,21 @@ func (c *Crawler) SaveTest() error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		err = errors.Join(err, f.Close())
+	}()
 	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
 	return enc.Encode(targets)
 }
 
-func (c *Crawler) InitTest() {
-	ctx := context.Background()
-	c.redis.FlushDB(ctx)
+func (c *Crawler) InitTest(parent context.Context) error {
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+
+	if err := c.redis.FlushDB(ctx); err != nil {
+		return fmt.Errorf("test Redis reset: %w", err)
+	}
 	log.Println("[INFO] Init test completed: Redis cleared")
+	return nil
 }
