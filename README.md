@@ -1,254 +1,205 @@
 # gfap
 
-A continuous, self-re-seeding Go web crawler for discovering lost media on VidLii.com. Targets videos uploaded before December 31, 2021 with CJK (Han/Hiragana/Katakana/Hangul) or non-Latin characters in their titles and duration ≥ 10 minutes.
+A continuous Go crawler for discovering lost media on VidLii.com. Every parsed video is stored in MongoDB. Targets have an upload date on or before December 31, 2023, a duration of at least 10 minutes, and CJK or other non-Latin letters in their titles.
+
+## Quick start
+
+Prepare `.env`, Go dependencies, and Docker images as described below. Run from the project root:
+
+```sh
+make infra-start   # production Redis, MongoDB and Prometheus
+make test          # separate, disposable test Redis and MongoDB
+make run           # production crawler in the foreground
+```
+
+Testing does not require production services to be running. Check the test's exit status and per-worker results before starting production. Reaching its time limit is a failure, not a pass; see [current validation limits](#current-validation-limits).
+
+## Requirements and configuration
+
+- Go 1.25.7 or newer, matching [go.mod](go.mod).
+- Make and Docker Compose. Infrastructure targets invoke `docker-compose`; the test invokes `docker compose`.
+- Locally available `redis/redis-stack:latest` and `mongo:7` images for testing. The test does not pull images.
+- Prepared Go dependencies: `make test` uses the local toolchain, disables network module acquisition, and builds with read-only module files.
+- Memory for a billion-entry Bloom filter (approximately 2.8 GiB), the frontier and MongoDB. Running production and test together requires memory for both Redis instances.
+
+Example `.env` with placeholder credentials:
+
+```dotenv
+STATIC_PROXY_URLS=http://USER:PASSWORD@HOST1:PORT,http://USER:PASSWORD@HOST2:PORT
+VIDLII_USERNAME=your-username
+VIDLII_PASSWORD=your-password
+WORKERS=20
+RATE_LIMIT_SEC=30
+```
+
+Supply **100 comma-separated proxy URLs** for the test; the two entries above illustrate the format. URL-encode reserved characters in credentials. Keep `.env` private; the working-tree ignore rules exclude it.
+
+| Setting | Production | Test |
+| --- | --- | --- |
+| Workers | `WORKERS`, default 20 | Fixed at 100 |
+| Request spacing | `RATE_LIMIT_SEC`, default 15 seconds | At least 30 seconds per worker; slower settings preserved |
+| Proxies | One fixed list entry per worker | First 100 entries; missing entries fail validation |
+| Redis | `REDIS_ADDR`, default `localhost:6379`, DB 0 | `127.0.0.1:16379`, DB 1 |
+| MongoDB | `MONGO_URI`, default `mongodb://localhost:27017`, database `vidlii` | `mongodb://127.0.0.1:37017`, database `gfap_test` |
+| Metrics port | 2112 | 2113 |
+| Log | `crawler.log` | `crawler.test.log` |
+
+Test configuration ignores production storage endpoint overrides. Production startup rejects the reserved test storage ports and database name. Test and production use separate containers and volumes, not just different Redis database indexes.
+
+Production workers without an assigned proxy use a direct connection. Supply at least as many entries as `WORKERS` when every worker must use a proxy. Loading 100 entries does not change the production worker count. Use distinct endpoints when testing 100 different proxies.
+
+Login runs once over a direct connection, then workers share the cookie jar. The current login check accepts HTTP 200; that alone does not prove authentication or session validity across proxy IPs.
+
+## Local proxy and crawler test
+
+```sh
+make test
+```
+
+The target builds a temporary binary, starts [docker-compose.test.yml](docker-compose.test.yml), and runs the real crawler with:
+
+- **100 workers**, staggered starts, and at least 30 seconds between requests per worker.
+- **200 stored videos or a two-minute crawl deadline**, whichever stops the crawl first. In-flight writes can overshoot the target. Startup, final checkpoint and cleanup add time outside that deadline.
+- `TEST_URL` as the initial page, defaulting to `https://www.vidlii.com/user/rinkomania`.
+- Duplicate seed-admission checks and observations that fail on concurrent processing of the same canonical URL.
+- A requirement for every worker to fetch and store at least one video. Listing-page success alone does not verify video access.
+
+Workers continue after their first video. A rate-limited worker can retire while others continue. After workers join, each logs its zero-based `proxy_slot`, parsed-page count, stored-video count, and result: `video_stored`, `rate_limited`, or `unverified`. An unverified proxy has not demonstrated video access in this workload; it is not necessarily unusable.
+
+A full pass requires the video target, coverage of every worker, no retired workers or detected overlap, and a Mongo unique-record count matching recorded writes. Timeout, insufficient work, missing coverage, or a storage/checkpoint failure produces a nonzero exit. Two minutes permits only about four request starts per worker at this spacing, so it may not verify every proxy or exercise the five-consecutive-rate-limit cutoff.
+
+After workers and reconcilers join, the test attempts a final crawl-state checkpoint with a separate 30-second timeout, including when the crawl failed. A successful run exports matching videos to `targets.test.json`. Logs remain available on failure; an existing JSON export may belong to an earlier successful run.
+
+The Makefile removes test containers, their dedicated volumes and network, and the temporary binary on normal completion, failure, or handled interruption. Logs and exports are retained. Forced termination or a machine crash can leave resources behind; the next test discards the fixed test resources before starting. Run only one test at a time per host. Production Redis configuration and volumes are not reset by this workflow.
 
 ## Architecture
 
 ```text
-[Start] seeds.txt (fresh) or MongoDB Resume (fallback)
-      │
-      ▼
-┌─────────────────────────────────────────────────────────┐
-│                 URL Management & Queue                  │
-│                                                         │
-│   ┌────────────────┐ (overflow push) ┌────────────────┐ │
-│   │ Memory Channel │ ──────────────► │   Redis List   │ │
-│   │   (c.queue)    │ ◄────────────── │crawler:overflow│ │
-│   └───────┬────────┘  (drain back)   └────────────────┘ │
-└───────────┼─────────────────────────────────────────────┘
-            │
-            ▼ Dequeue URL → Canonicalize → Bloom check
-┌─────────────────────────────────────────────────────────┐
-│            Worker Pool (20 goroutines)                  │
-│                                                         │
-│   1. Per-worker rate limiter (golang.org/x/time/rate)   │
-│            │                                            │
-│   2. HTTP Fetch via static residential proxy            │
-│            │  → 10 consecutive 429s → back off          │
-│            │  → 20 consecutive errors → back off        │
-│            │                                            │
-│   3. Status check + rate-limit title detection          │
-│            │                                            │
-│   4. Bloom Filter de-dup (Redis BF.ADD)                 │
-│            │  baseURL bypasses filter                   │
-│   5. HTML Parser (goquery)                              │
-└──────┬──────────────────────────────────────────┬───────┘
-       │                                          │
-       ▼ (extracted links → canonicalize)  ▼ (video metadata)
-[Push back to Queue]        ┌───────────────────────────┐
-                            │   Three-condition match   │
-                            │                           │
-                            │ 1. MatchDate  (pre-2022)  │
-                            │ 2. HasCJKChar or          │
-                            │    HasNonEnglishChar      │
-                            │ 3. MatchDuration (≥10min) │
-                            └────────────┬──────────────┘
-                                         │
-                                         ▼
-                            ┌───────────────────────────┐
-                            │        Persistence        │
-                            │                           │
-                            │ Upsert all videos         │
-                            │ (all flags stored)        │
-                            └───────────────────────────┘
+Startup: verify Bloom -> reconcile stored video URLs -> restore crawl state
+                                      |
+                                      v
+             Redis frontier: ready -> processing + lease
+                    ^                     |
+          due listings / delayed     proxy workers
+                    ^                     |
+          scheduler and recovery <- outcome / discovered URLs
+                                          |
+                                          v
+                                MongoDB video upserts
 
-[Idle Monitor] queue exhausted → re-seed baseURL every 10 min → crawl indefinitely
-[Observability] Prometheus: pages_processed, video_found, targets_found, queue_size, errors
+Redis listing/dead state -> periodic checkpoint -> MongoDB crawler_state_v1
 ```
 
-## Technical Highlights
+See [DESIGN.md](DESIGN.md) for frontier contracts and [internal/storage/frontier.go](internal/storage/frontier.go) for their implementation.
 
-* **Bloom Filter De-duplication:** Replaces per-URL Redis `SetNX` keys (~20GB at scale) with a single non-scaling Bloom filter (`crawler:bloom`, 1B capacity, 0.001% FPR, ~3GB). Sized for one-shot discovery — at the expected ~50M actual inserts, effective FPR drops below 10⁻²⁰. Bloom is pre-reserved `NONSCALING` at startup so it never silently auto-scales with degraded FPR. Verified at startup via `BloomVerify()` — mismatched capacity is a hard fatal. Persists across restarts via Redis AOF + RDB snapshots.
-* **URL Canonicalization:** All URLs are normalized before Bloom and Mongo see them — fragments stripped, video URLs reduced to `/watch?v=<id>` (dropping `&t=`, `&list=`, `&index=`, `&from=`, `&ref=`), trailing slashes normalized on non-video pages. Collapses variant strings per page to a single key so Bloom and Mongo dedup on the same identifier and the rate budget isn't burned on duplicate fetches.
-* **Bloom-before-Enqueue:** `enqueue()` checks `BF.EXISTS` before adding to the queue — already-seen URLs are dropped before they ever enter the channel or overflow list, keeping the queue lean and skipping the fetch entirely.
-* **Elastic Overflow Queue:** A buffered Go channel handles in-memory URL distribution. When full, excess URLs push to a Redis List (`crawler:overflow`) and drain back in the background — preventing OOM during link explosions. Diagnosed a 1.1M-goroutine leak via Prometheus `go_goroutines` spike — traced to unbounded goroutine spawning when the channel saturated; redesigned this path, reducing peak memory from 4GB to 192MB. `inFlight` accounting is balanced across all paths: `+1` on enqueue, `-1` unconditionally at worker bottom, `+1` on overflow re-push so retried URLs remain counted.
-* **Graceful Shutdown:** Workers select on both `stopChan` and the queue — no `close(c.queue)` (multiple senders). All `time.Sleep` backoffs replaced with `select{ctx.Done/time.After}` so workers wake immediately on SIGTERM instead of blocking up to 60s. `sync.WaitGroup` ensures `Run()` waits for every goroutine before returning. SIGTERM and SIGINT both invoke `c.Stop()` via `signal.Notify`; `/stop` HTTP endpoint remains as an alternative.
-* **Per-worker Proxy Isolation:** Each of 20 workers is assigned a dedicated static residential proxy IP at startup. Rate limits and errors are tracked per-worker (`consecFails`, `consecErrors`) and back off independently — one flagged IP doesn't pause the other 19. After 10 consecutive rate limits or 20 consecutive errors, the affected worker backs off with exponential sleep before resuming on its own IP.
-* **Shared Cookie Jar:** Login is performed once before the crawl starts. All 20 workers share a single `http.CookieJar`, verified to support concurrent sessions on VidLii, eliminating per-worker authentication overhead.
-* **Fetch-before-Bloom Ordering:** HTTP status and rate-limit title are checked before `BF.ADD`. Non-200 and rate-limited video pages push to overflow without entering the filter — ensuring retryability without a `BF.REMOVE` operation.
-* **Three-condition Targeting:** Every video page is upserted to MongoDB regardless of match status — reported `video:duration` metadata can be wrong, so the full corpus stays queryable for re-evaluation. Per-video match flags (`match_date`, `has_cjk_char`, `match_duration`, `has_non_english_char`) are stored independently. `IsTarget = MatchDate && MatchDuration && (HasCJKChar || HasNonEnglishChar)`.
-* **Continuous Self-re-seeding:** The base URL bypasses Bloom filter de-dup so `idleMonitor` re-discovers new links every 10 minutes as VidLii adds content, without manual restarts.
-* **Persistent State Layering:** Bloom persists via Redis AOF + RDB snapshots; MongoDB is the canonical artifact store. Loss of Redis triggers re-crawling but no data loss; `Resume()` rebuilds Bloom from Mongo on cold start. Loss of Mongo loses the harvested video corpus — `make fresh` is the only path that drops Mongo and requires typed confirmation.
-* **Fault Tolerance:** Failed fetches retry up to 3 times with linear backoff. Rate-limited responses back off per-worker and are never entered into the Bloom filter.
+- **Redis owns queued work.** Ready jobs, processing jobs, leases and delayed retries replace the old in-memory channel and overflow queue. Atomic scripts implement admission and job transitions.
+- **Deduplication happens at admission.** Video URLs are claimed in a non-scaling Bloom filter. Listings use a schedule with a pending marker while a job exists. Canonicalization strips fragments and reduces video URLs to their video identifier.
+- **Workers make one fetch attempt per leased job.** They store metadata, admit discovered links, and resolve the job. Reconciliation recovers expired leases and orphaned jobs. This does not guarantee that a worker still processing after lease expiry cannot overlap a replacement worker.
+- **Listings are revisited on schedule.** The base page is scheduled at startup. Seed revisit TTL defaults to 24 hours, other listings to 72 hours, with longer intervals for barren listings. An empty queue does not immediately re-add the main page.
+- **Matching is independent of storage.** All parsed videos are upserted by canonical URL; individual match flags remain queryable. See [internal/model/video.go](internal/model/video.go).
 
----
+## Rate limits and worker shutdown
 
-## Requirements
+HTTP 429 and recognized rate-limit page titles returned with HTTP 200 use the rate-limit retry path. Matching is case-insensitive and recognizes `Rate Limited`, `Rate Limiting`, `Rate Limit Exceeded`, and `Too Many Requests`. Arbitrary body text is not scanned.
 
-* **Go:** 1.25+
-* **Docker & Docker Compose**
-* **Webshare static residential proxies** (20 IPs) configured in `.env`
-* **RAM:** 6GB minimum, 8GB recommended (Bloom ~3GB, Mongo working set ~1–2GB, Prometheus + crawler + OS overhead ~1GB)
-* **Disk:** ~10GB (Mongo grows with corpus; Redis snapshots add a few GB)
+- **Per URL:** default rate-limit delays are 5, 15, then 45 minutes. These responses do not add ordinary failure strikes. Other retryable failures use a separate strike/backoff policy.
+- **Per worker:** five consecutive recognized rate-limit responses retire that worker. Other completed outcomes reset that streak; cancellation does not count. Generic consecutive failures produce warnings at multiples of five.
+- **Before retirement:** the current outcome goes through frontier resolution, then the worker closes idle HTTP connections and returns. Resolution errors are logged; successful lease release is not guaranteed if Redis fails.
+- **Production:** healthy workers continue. When all workers exit, their supervisor cancels the scheduler and main joins shutdown. There is no automatic proxy rotation or worker replacement.
 
----
+SIGINT, SIGTERM, and a local `POST /stop` also cancel the crawl. To replace proxies, stop the process, wait for it to exit, edit `.env`, and restart against the saved stores.
 
-## First-time Setup
+## Persistence and recovery
 
-```bash
-make infra-start   # starts containers and auto-reserves 1B Bloom if missing
-```
+MongoDB stores videos in `videos` and listing schedules, barren counts, and dead/quarantine state in `crawler_state_v1`. Production crawl-state checkpoints run immediately after startup and every ten minutes, using acknowledged, journaled writes.
 
-Verify Bloom is correctly reserved:
-```bash
-docker exec gfap-redis-1 redis-cli BF.INFO crawler:bloom
-# Capacity should be 1000000000, Number of filters should be 1
-```
+Startup reconciles stored video URLs into Bloom and restores crawl state before admitting new work. Cold restore supports recovery after complete frontier loss; it does **not** restore queued jobs, leases, attempts, or strikes. Lost queued work must be rediscovered through listing visits.
 
-Configure proxies in `.env`:
-```
-STATIC_PROXY_URLS=http://user:pass@ip:port/,...  # 20 comma-separated
-VIDLII_USERNAME=your-username
-VIDLII_PASSWORD=your-password
-```
+A valid nonempty Redis frontier is preserved on restart. Newer Mongo state is not merged over an older nonempty Redis snapshot; a later checkpoint can copy that older Redis state back into Mongo.
 
----
+The supplied Redis Compose configuration disables AOF and automatic save points. The crawler requests an RDB snapshot every six hours. `make snapshot` requests a snapshot and prints its result; `make infra-stop` runs that target before stopping production services. Check the reported save status before relying on it.
 
-## Quick Start
+**Current shutdown limitation:** production joins workers and periodic reconcilers but does not perform a final crawl-state checkpoint afterward. The bounded test does perform that checkpoint. Stopping the crawler alone also does not request a final Redis snapshot.
 
-```bash
-# 1. Start backend services
-make infra-start
+## Commands
 
-# 2. First run — seed from seeds.txt (237 known URLs)
-make fresh
-
-# 3. Monitor
-make status
-make logs
-make metrics
-```
-
----
-
-## Commands Reference
-
-| Command | Description |
+| Command | Behavior |
 | --- | --- |
-| `make infra-start` | Start Redis Stack, MongoDB, and Prometheus; auto-reserve Bloom if missing |
-| `make infra-stop` | Stop Docker services |
-| `make infra-logs` | View Docker container logs |
-| `make build` | Compile the crawler binary |
-| `make fresh` | First run — drops corpus and seeds from seeds.txt (**irreversible**, requires confirmation) |
-| `make resume` | Resume production crawl from last checkpoint |
-| `make reset-bloom` | Delete Bloom filter only — safe for MongoDB, use before changing bloom params |
-| `make test` | Bounded test crawl (50 videos, test URL) |
-| `make stop` | Graceful crawler shutdown via HTTP |
-| `make metrics` | Print live Prometheus metrics |
-| `make logs` | Tail crawler.log |
-| `make status` | Show Docker and crawler process status |
-| `make restart` | Rebuild and restart crawler |
-| `make clean` | Delete all data, logs, and volumes (**irreversible**, requires confirmation) |
-| `make k8s-up` | Build image, load into kind cluster, apply manifests |
-| `make k8s-down` | Delete kind cluster |
-| `make k8s-verify` | Check pods, crawler metrics, Prometheus scrape |
+| `make infra-start` | Start production services; reserve Bloom if missing |
+| `make infra-stop` | Request a Redis snapshot, then stop production services |
+| `make infra-logs` | Show production service logs |
+| `make snapshot` | Request an RDB snapshot and print save status |
+| `make build` | Build `./crawler` |
+| `make run` | Build and run production in the foreground |
+| `make test` | Run the isolated 100-worker test and clean up its resources |
+| `make stop` | Request production shutdown through the local HTTP endpoint |
+| `make logs` | Follow `crawler.log` |
+| `make metrics` | Print production metrics |
+| `make status` | Show production services and crawler processes |
+| `make resume` | Legacy background launcher; signals existing crawler processes first |
+| `make restart` | Legacy rebuild/background launcher with a fixed one-second shutdown delay |
+| `make k8s-up` | Build/load the image and apply the local kind manifests |
+| `make k8s-down` | Delete the local kind cluster |
+| `make k8s-verify` | Run the existing Kubernetes checks |
 
----
+The legacy `make fresh` target contains a `nohub` typo and an outdated data-deletion warning. The actual `-fresh` flag adds URLs from `seeds.txt`; it does not drop MongoDB. To request that behavior directly:
 
-## Project Structure
-
-```text
-cmd/crawler/        — entry point (main.go)
-internal/
-  ├── config/       — crawler configuration + proxy URL list (loaded from .env)
-  ├── crawler/      — worker pool, queue, idle monitor, bloom dedup,
-  │                   URL canonicalizer, per-worker rate limiter and backoff
-  ├── storage/      — Redis (Bloom + overflow) & MongoDB clients
-  ├── metrics/      — Prometheus instrumentation + /stop endpoint
-  ├── model/        — Video struct, match flags, CJK/non-Latin detection
-  └── auth/         — HTTP client with shared cookie jar + proxy transport
-k8s/                — Kubernetes manifests (kind local cluster)
-  ├── kustomization.yaml
-  ├── namespace.yaml
-  ├── crawler-configmap.yaml
-  ├── crawler-secret.example.yaml
-  ├── crawler-deployment.yaml
-  ├── redis-deployment.yaml
-  ├── mongo-deployment.yaml
-  ├── prometheus-configmap.yaml
-  └── prometheus-deployment.yaml
-seeds.txt           — 237 known VidLii URLs for cold start
-.env                — proxy credentials (gitignored)
+```sh
+make build
+./crawler -fresh
 ```
 
----
+Stop the previous crawler before starting another instance. The legacy `resume`/`restart` helpers do not reliably wait for it to finish. The old `reset-bloom` and `clean` targets have been removed; some existing Bloom error messages still refer to `reset-bloom`.
 
 ## Monitoring
 
-* **Prometheus:** `http://localhost:9090`
-* **Raw metrics:** `http://localhost:2112/metrics`
+- Production metrics: `http://localhost:2112/metrics`.
+- Test metrics while running: `http://localhost:2113/metrics`.
+- Production Prometheus: `http://localhost:9090`.
 
-Key metrics: `pages_processed`, `video_found`, `targets_found`, `queue_size`, `fetch_duration_seconds`, `errors`
+Useful metrics include `pages_processed`, `video_found`, `targets_found`, `fetch_duration_seconds`, `frontier_ready`, `frontier_processing`, `frontier_delayed`, `bloom_fill_ratio`, `lease_errors_total`, `resolve_errors_total`, and `reconcile_errors_total`.
 
-Sanity check after a run — `video_found` and `db.videos.countDocuments()` should agree within a small margin. Divergence indicates silent Mongo write failures or a canonicalization regression.
+`video_found` counts parsed video responses before Mongo writes; it is not a unique stored-record count. Use Mongo counts and test worker summaries to assess storage and proxy coverage.
 
----
+## Current validation limits
 
-## Local Kubernetes (kind)
+The September 22, 2026 local run started all 100 workers and made 400 requests within the two-minute crawl window. Worker summaries recorded 48 stored videos through 40 proxies; 60 proxies remained unverified. Five responses were HTTP 429. No concurrent processing of the same URL was observed. The final checkpoint completed and test containers, volumes and network were removed.
 
-A local-test integration using [kind](https://kind.sigs.k8s.io/) and vanilla upstream Kubernetes objects. Demonstrates Deployment, Service, liveness probes, resource requests/limits, PVC-backed stateful services, and Prometheus scrape — without Helm, operators, or HPA.
+That run **failed** the 200-video/all-proxy criteria. It did not exercise five-consecutive-rate-limit retirement or authenticated access. An offline build and a bounded crawl do not establish production readiness or universal deduplication guarantees.
 
-gfap is a stateful singleton: it's a non-scalable Deployment with `Recreate` strategy, not behind an HPA. Scaling replicas would double-crawl VidLii and break per-worker proxy isolation. Readiness probe is omitted — nothing routes client traffic to the crawler so readiness is semantically weak here.
+## Project structure
 
-**Prerequisites:**
-```bash
-brew install kind kubectl   # macOS
-# or https://kind.sigs.k8s.io and https://kubernetes.io/docs/tasks/tools/
+```text
+cmd/crawler/                  Startup, mode routing and shutdown
+internal/auth/                HTTP clients, login and shared cookies
+internal/config/              Environment loading and fixed test settings
+internal/crawler/             Parsing, workers and integrated test checks
+internal/storage/             Redis frontier/Bloom, Mongo and crawl-state recovery
+internal/scheduler/           Reconciliation, listing scheduling and checkpoints
+internal/metrics/             Metrics and local stop endpoint
+internal/model/               Video records and target matching
+docker-compose.yml            Production services
+docker-compose.test.yml       Disposable test services
+k8s/                          Local kind deployment manifests
+seeds.txt                     Optional startup URLs for -fresh
 ```
 
-**Setup:**
-```bash
+## Local Kubernetes
+
+The existing kind deployment uses one crawler replica with `Recreate` strategy. Multiple crawler processes sharing one frontier are outside the current ownership model.
+
+With kind and kubectl available, prepare the secret file from the example, fill in its credentials, then use the existing targets:
+
+```sh
 cp k8s/crawler-secret.example.yaml k8s/crawler-secret.yaml
-# fill in VIDLII_USERNAME, VIDLII_PASSWORD, STATIC_PROXY_URLS
 make k8s-up
-```
-
-`k8s-up` creates the kind cluster, builds and loads the image, applies the namespace, secret, and all manifests, then waits for rollout. An initContainer reserves the 1B NONSCALING Bloom filter before the crawler starts — idempotent on pod restart.
-
-**Verify:**
-```bash
-kubectl get pods -n gfap
-kubectl logs -n gfap -l app=gfap-crawler -c bloom-init
-kubectl port-forward -n gfap svc/gfap-crawler 2112:2112 &
-curl http://localhost:2112/metrics | grep -E "pages_processed|video_found"
-```
-
-**Graceful shutdown test:**
-```bash
-kubectl delete pod -n gfap -l app=gfap-crawler
-kubectl logs -n gfap -l app=gfap-crawler --previous | tail -20
-# expect clean shutdown log, no panic
-```
-
-**Tear down:**
-```bash
+make k8s-verify
+# When finished:
 make k8s-down
 ```
 
----
-
-## VPS Deployment
-
-**Debian/Ubuntu:**
-```bash
-sudo apt update && sudo apt install -y docker.io docker-compose golang-go git make
-```
-
-**RHEL/Fedora:**
-```bash
-sudo dnf install -y docker docker-compose golang git make
-sudo systemctl enable --now docker
-```
-
-```bash
-git clone https://github.com/chenbenny31/gfap.git && cd gfap
-cp .env.example .env  # fill in proxy credentials
-make infra-start
-make fresh
-```
-
----
+The isolated `make test` workflow runs locally with Docker Compose; it does not validate Kubernetes deployment or production shutdown durability.
 
 ## License
 
-GPL-3.0. See [LICENSE](LICENSE) for full text.
+GPL-3.0. See [LICENSE](LICENSE).

@@ -1,0 +1,47 @@
+name: gfap-test
+
+services:
+  redis-test:
+    image: redis/redis-stack:latest
+    pull_policy: never
+    container_name: gfap-test-redis
+    labels:
+      gfap.scope: test
+    environment:
+      REDIS_ARGS: >-
+        --appendonly no --save ""
+        --maxmemory ${REDIS_MAXMEMORY:-4500mb}
+        --maxmemory-policy noeviction
+    ports:
+      - "127.0.0.1:16379:6379"
+    volumes:
+      - test-redis-data:/data
+    restart: "no"
+
+  mongo-test:
+    image: mongo:7
+    pull_policy: never
+    container_name: gfap-test-mongo
+    labels:
+      gfap.scope: test
+    command: ["--wiredTigerCacheSizeGB", "1.5"]
+    ports:
+      - "127.0.0.1:37017:27017"
+    volumes:
+      - test-mongo-data:/data/db
+      - test-mongo-config:/data/configdb
+    restart: "no"
+
+volumes:
+  test-redis-data:
+    name: gfap-test-redis-data
+    labels:
+      gfap.scope: test
+  test-mongo-data:
+    name: gfap-test-mongo-data
+    labels:
+      gfap.scope: test
+  test-mongo-config:
+    name: gfap-test-mongo-config
+    labels:
+      gfap.scope: test

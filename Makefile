@@ -1,7 +1,7 @@
 METRICS_PORT = 2112
 BINARY = ./crawler
 
-.PHONY: help infra-start infra-stop infra-logs build fresh resume test stop metrics logs reset-bloom snapshot
+.PHONY: help infra-start infra-stop infra-logs build run fresh resume test stop metrics logs status restart snapshot
 
 help:
 	@echo "gfap — commands:"
@@ -10,16 +10,15 @@ help:
 	@echo "  make snapshot     force a redis RDB snapshot now"
 	@echo "  make infra-logs   log Docker services"
 	@echo "  make build        build crawler binary"
+	@echo "  make run          run production crawler in the foreground"
 	@echo "  make fresh        first run — drops corpus, seeds from seeds.txt"
 	@echo "  make resume       resume production crawl"
-	@echo " make reset-bloom   delete bloom filter only, safe for MongoDB"
-	@echo "  make test         bounded test crawl"
+	@echo "  make test         isolated test crawl with automatic cleanup"
 	@echo "  make stop         graceful crawler shutdown"
 	@echo "  make metrics      print Prometheus metrics"
 	@echo "  make logs         tail crawler log"
 	@echo "  make status       show service and crawler status"
 	@echo "  make restart      rebuild and restart crawler"
-	@echo "  make clean        stop everything and remove all data"
 	@echo "  make k8s-up      build image, load into kind, apply manifests"
 	@echo "  make k8s-down    delete kind cluster"
 	@echo "  make k8s-verify  check pods, metrics, prometheus scrape"
@@ -49,6 +48,9 @@ infra-logs:
 build:
 	go build -o $(BINARY) cmd/crawler/main.go
 
+run: build
+	$(BINARY)
+
 fresh: build
 	@echo "WARNING: drops MongoDB corpus and flushes Redis, irreversible."
 	@read -p "Type 'fresh' to continue: " a && [ "$$a" = "fresh" ] || { echo aborted; exit 1; }
@@ -59,12 +61,48 @@ resume: build
 	-@pkill -x crawler
 	@nohup $(BINARY) > /dev/null 2>&1 & echo "Crawler resumed"
 
-reset-bloom:
-	docker exec gfap-redis-1 redis-cli DEL crawler:bloom
-	@echo "Bloom filter deleted. Run make resume to re-init and re-seed from MongoDB."
-
 test:
-	go run cmd/crawler/main.go -test
+	@set -eu; \
+	compose() { docker compose --env-file /dev/null -p gfap-test -f docker-compose.test.yml "$$@"; }; \
+	binary=""; pid=""; started=0; \
+	cleanup() { \
+		status=$$?; trap - EXIT; trap '' INT TERM HUP; \
+		if [ -n "$$pid" ]; then \
+			if kill -0 "$$pid" 2>/dev/null; then kill -TERM "$$pid" || status=1; fi; \
+			if wait "$$pid"; then :; else \
+				child_status=$$?; \
+				if [ "$$status" -eq 0 ]; then status=$$child_status; fi; \
+			fi; \
+		fi; \
+		if [ "$$started" -eq 1 ]; then \
+			compose down --volumes || { echo "Test resource cleanup failed" >&2; status=1; }; \
+		fi; \
+		if [ -n "$$binary" ]; then \
+			rm -f -- "$$binary" || { echo "Test binary cleanup failed" >&2; status=1; }; \
+		fi; \
+		exit "$$status"; \
+	}; \
+	trap cleanup EXIT; \
+	trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP; \
+	binary=$$(mktemp /tmp/gfap-test.XXXXXX); \
+	env GOTOOLCHAIN=local GOPROXY=off GONOPROXY=none GOVCS='*:off' GOWORK=off \
+		go build -mod=readonly -buildvcs=false -o "$$binary" ./cmd/crawler; \
+	started=1; \
+	compose down --volumes; \
+	compose up -d; \
+	ready=0; attempt=0; \
+	while [ "$$attempt" -lt 30 ]; do \
+		if [ "$$(compose exec -T redis-test redis-cli --raw ping 2>/dev/null)" = PONG ] && \
+			compose exec -T mongo-test mongosh --quiet \
+				--eval 'quit(db.adminCommand({ping: 1}).ok ? 0 : 1)' >/dev/null 2>&1; then \
+			ready=1; break; \
+		fi; \
+		attempt=$$((attempt + 1)); sleep 1; \
+	done; \
+	if [ "$$ready" -ne 1 ]; then echo "Test storage did not become ready" >&2; exit 1; fi; \
+	"$$binary" -test & pid=$$!; \
+	if wait "$$pid"; then result=0; else result=$$?; fi; \
+	pid=""; exit "$$result"
 
 stop:
 	curl -s -X POST http://localhost:$(METRICS_PORT)/stop
@@ -86,12 +124,6 @@ restart: build
 	-@pkill -x crawler
 	@sleep 1
 	@nohup $(BINARY) > /dev/null 2>&1 & echo "Crawler restarted"
-
-clean:
-	@echo "WARNING: deletes all data"
-	-@pkill -x crawler
-	-docker exec gfap-redis-1 redis-cli FLUSHALL
-	docker-compose down -v
 
 .PHONY: k8s-up k8s-down k8s-verify
 
