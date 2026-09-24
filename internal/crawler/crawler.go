@@ -12,15 +12,17 @@ import (
 	"gfap/internal/storage"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	maxTestVideos = 200             // test mode only
-	testDeadline  = 2 * time.Minute // hard stop for a test run
+	maxTestVideos = 200              // test mode only
+	testDeadline  = 10 * time.Minute // hard stop for a test run
 )
 
 type Crawler struct {
@@ -39,7 +41,8 @@ type Crawler struct {
 	testParsed   []int
 	testErr      error
 	testStored   []int
-	testRetired  []bool
+	testRetired  []string
+	testFailures []map[string]int
 	testFinished int
 }
 
@@ -96,30 +99,45 @@ func (c *Crawler) Clear() {
 
 // canonicalize returns the canonical form of a vidlli url, or "" to skip
 func (c *Crawler) canonicalize(raw string) string {
-	// strip fragment
-	if i := strings.Index(raw, "#"); i >= 0 {
-		raw = raw[:i]
+	base, err := url.Parse(c.cfg.BaseUrl)
+	if err != nil {
+		return ""
 	}
-
-	// should be on the same host
-	if !strings.HasPrefix(raw, c.cfg.BaseUrl) {
+	u, err := url.Parse(raw)
+	if err != nil || u.User != nil ||
+		u.Scheme != base.Scheme ||
+		!strings.EqualFold(u.Host, base.Host) {
 		return ""
 	}
 
-	// video page: keep only ?=v<id>
-	if idx := strings.Index(raw, c.cfg.VideoPattern); idx >= 0 {
-		rest := raw[idx+len(c.cfg.VideoPattern):]
-		if rest == "" {
+	u.Fragment = ""
+	u.Host = base.Host
+	path := strings.TrimRight(u.Path, "/")
+
+	switch path {
+	case "/watch":
+		id := u.Query().Get("v")
+		if id == "" || strings.ContainsAny(id,
+			" \t\r\n/?&#%\\") {
 			return ""
 		}
-		if amp := strings.Index(rest, "&"); amp >= 0 {
-			rest = rest[:amp]
+		return c.cfg.BaseUrl + c.cfg.VideoPattern +
+			url.QueryEscape(id)
+
+	case "", "/videos", "/channels", "/results",
+		"/community", "/special_videos", "/contests":
+		// Public discovery pages.
+
+	default:
+		if !strings.HasPrefix(path, "/user/") &&
+			!strings.HasPrefix(path, "/contest/") {
+			return ""
 		}
-		return c.cfg.BaseUrl + c.cfg.VideoPattern + rest
 	}
 
-	// non-video page
-	return strings.TrimRight(raw, "/")
+	u.Path = path
+	u.RawPath = ""
+	return u.String()
 }
 
 // Seed admits every URL in path (one per line) directly, for -fresh startup.
@@ -173,7 +191,8 @@ func (c *Crawler) RunTest(parent context.Context, seedURL string) error {
 	c.testParsed = make([]int, c.cfg.Workers)
 	c.testErr = nil
 	c.testStored = make([]int, c.cfg.Workers)
-	c.testRetired = make([]bool, c.cfg.Workers)
+	c.testRetired = make([]string, c.cfg.Workers)
+	c.testFailures = make([]map[string]int, c.cfg.Workers)
 	c.testFinished = 0
 	c.mu.Unlock()
 	ctx, cancel := context.WithTimeout(parent, testDeadline)
@@ -278,15 +297,25 @@ func (c *Crawler) recordTestStart(url string) {
 	c.testActive[url]++
 }
 
-func (c *Crawler) recordTestFinish(workerID int, url string, kind pageKind) {
+func (c *Crawler) recordTestFinish(workerID int, url string, out pageOutcome) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.testActive[url]--
 	if c.testActive[url] == 0 {
 		delete(c.testActive, url)
 	}
-	if kind == pageVideo || kind == pageListing {
+	if out.kind == pageVideo || out.kind == pageListing {
 		c.testParsed[workerID]++
+	}
+	if out.kind == pageRetryable || out.kind == pageInvalidResponse || out.kind == pageUnknown {
+		if c.testFailures[workerID] == nil {
+			c.testFailures[workerID] = make(map[string]int)
+		}
+		reason := out.reason
+		if reason == "" {
+			reason = "unknown_response"
+		}
+		c.testFailures[workerID][reason]++
 	}
 }
 
@@ -306,9 +335,9 @@ func (c *Crawler) validateTestWorkers() error {
 	for workerID, parsed := range c.testParsed {
 		status := "video_stored"
 		switch {
-		case c.testRetired[workerID]:
-			status = "rate_limited"
-			result = errors.Join(result, fmt.Errorf("test worker %d stopped after consecutive rate limits", workerID))
+		case c.testRetired[workerID] != "":
+			status = c.testRetired[workerID]
+			result = errors.Join(result, fmt.Errorf("test worker %d stopped: %s", workerID, status))
 		case c.testStored[workerID] == 0:
 			status = "unverified"
 			result = errors.Join(result, fmt.Errorf("test worker %d did not store a video", workerID))
@@ -317,6 +346,49 @@ func (c *Crawler) validateTestWorkers() error {
 			workerID, workerID, parsed, c.testStored[workerID], status)
 	}
 	return result
+}
+
+// TestWorkerSummary reports evidence from a completed test without changing its result.
+func (c *Crawler) TestWorkerSummary() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var rows strings.Builder
+	verified, unverified, retired, withErrors, writes := 0, 0, 0, 0, 0
+	for id, parsed := range c.testParsed {
+		stored := c.testStored[id]
+		writes += stored
+		status := "video_stored"
+		if c.testRetired[id] != "" {
+			status = c.testRetired[id]
+			retired++
+		} else if stored == 0 {
+			status = "unverified"
+			unverified++
+		} else {
+			verified++
+		}
+		failures := c.testFailures[id]
+		if len(failures) != 0 {
+			withErrors++
+		}
+		if status == "video_stored" && len(failures) == 0 {
+			continue
+		}
+		keys := make([]string, 0, len(failures))
+		for reason := range failures {
+			keys = append(keys, reason)
+		}
+		sort.Strings(keys)
+		fmt.Fprintf(&rows, "\nworker=%d proxy_slot=%d result=%s parsed_pages=%d stored_videos=%d", id, id, status, parsed, stored)
+		if len(keys) == 0 {
+			rows.WriteString(" fetch_parse_errors=none")
+		}
+		for _, reason := range keys {
+			fmt.Fprintf(&rows, " %s=%d", reason, failures[reason])
+		}
+	}
+	return fmt.Sprintf("[INFO] Final test worker summary: workers=%d verified=%d unverified=%d retired=%d workers_with_fetch_parse_errors=%d reported_video_writes=%d%s",
+		len(c.testParsed), verified, unverified, retired, withErrors, writes, rows.String())
 }
 
 func (c *Crawler) SaveTest(parent context.Context) (err error) {

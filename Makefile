@@ -10,7 +10,7 @@ help:
 	@echo "  make snapshot     force a redis RDB snapshot now"
 	@echo "  make infra-logs   log Docker services"
 	@echo "  make build        build crawler binary"
-	@echo "  make run          run production crawler in the foreground"
+	@echo "  make run          start production crawler in the background"
 	@echo "  make fresh        first run — drops corpus, seeds from seeds.txt"
 	@echo "  make resume       resume production crawl"
 	@echo "  make test         isolated test crawl with automatic cleanup"
@@ -48,8 +48,17 @@ infra-logs:
 build:
 	go build -o $(BINARY) cmd/crawler/main.go
 
-run: build
-	$(BINARY)
+run:
+	@if pgrep -x crawler >/dev/null; then \
+		echo "Crawler already running; use make stop first" >&2; exit 1; \
+	fi
+	@$(MAKE) build
+	@nohup $(BINARY) </dev/null >>crawler.log 2>&1 & \
+	pid=$$!; sleep 1; \
+	kill -0 "$$pid" 2>/dev/null || { \
+		echo "Crawler exited; see crawler.log" >&2; exit 1; \
+	}; \
+	echo "Crawler started (PID $$pid); logs: make logs; stop: make stop"
 
 fresh: build
 	@echo "WARNING: drops MongoDB corpus and flushes Redis, irreversible."

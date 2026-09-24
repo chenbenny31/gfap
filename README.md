@@ -9,7 +9,7 @@ Prepare `.env`, Go dependencies, and Docker images as described below. Run from 
 ```sh
 make infra-start   # production Redis, MongoDB and Prometheus
 make test          # separate, disposable test Redis and MongoDB
-make run           # production crawler in the foreground
+make run           # production crawler in the background
 ```
 
 Testing does not require production services to be running. Check the test's exit status and per-worker results before starting production. Reaching its time limit is a failure, not a pass; see [current validation limits](#current-validation-limits).
@@ -59,14 +59,16 @@ make test
 The target builds a temporary binary, starts [docker-compose.test.yml](docker-compose.test.yml), and runs the real crawler with:
 
 - **100 workers**, staggered starts, and at least 30 seconds between requests per worker.
-- **200 stored videos or a two-minute crawl deadline**, whichever stops the crawl first. In-flight writes can overshoot the target. Startup, final checkpoint and cleanup add time outside that deadline.
+- **200 stored videos or a ten-minute crawl deadline**, whichever stops the crawl first. In-flight writes can overshoot the target. Startup, final checkpoint and cleanup add time outside that deadline.
 - `TEST_URL` as the initial page, defaulting to `https://www.vidlii.com/user/rinkomania`.
 - Duplicate seed-admission checks and observations that fail on concurrent processing of the same canonical URL.
 - A requirement for every worker to fetch and store at least one video. Listing-page success alone does not verify video access.
 
 Workers continue after their first video. A rate-limited worker can retire while others continue. After workers join, each logs its zero-based `proxy_slot`, parsed-page count, stored-video count, and result: `video_stored`, `rate_limited`, or `unverified`. An unverified proxy has not demonstrated video access in this workload; it is not necessarily unusable.
 
-A full pass requires the video target, coverage of every worker, no retired workers or detected overlap, and a Mongo unique-record count matching recorded writes. Timeout, insufficient work, missing coverage, or a storage/checkpoint failure produces a nonzero exit. Two minutes permits only about four request starts per worker at this spacing, so it may not verify every proxy or exercise the five-consecutive-rate-limit cutoff.
+A full pass requires the video target, coverage of every worker, no retired workers or detected overlap, and a Mongo unique-record count matching recorded writes. Timeout, insufficient work, missing coverage, or a storage/checkpoint failure produces a nonzero exit. Ten minutes permits about twenty request starts per worker at this spacing. Reaching 200 videos can stop the test earlier with some workers still unverified; a longer deadline does not guarantee coverage.
+
+The final crawler log block summarizes verified, unverified and retired workers and reported video writes. It lists every unverified/retired worker and any worker with fetch/parse errors, including those that later stored a video. Error counts use fixed labels such as `http_429`, `request_failed` and `uk_access_notice`; cancellations and ordinary 404/410 responses are excluded. These counts do not diagnose the underlying network error or classify storage failures as proxy failures.
 
 After workers and reconcilers join, the test attempts a final crawl-state checkpoint with a separate 30-second timeout, including when the crawl failed. A successful run exports matching videos to `targets.test.json`. Logs remain available on failure; an existing JSON export may belong to an earlier successful run.
 
@@ -130,7 +132,7 @@ The supplied Redis Compose configuration disables AOF and automatic save points.
 | `make infra-logs` | Show production service logs |
 | `make snapshot` | Request an RDB snapshot and print save status |
 | `make build` | Build `./crawler` |
-| `make run` | Build and run production in the foreground |
+| `make run` | Build and start production in the background; refuses an existing process named crawler |
 | `make test` | Run the isolated 100-worker test and clean up its resources |
 | `make stop` | Request production shutdown through the local HTTP endpoint |
 | `make logs` | Follow `crawler.log` |

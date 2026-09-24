@@ -42,6 +42,7 @@ const (
 	pageRetryable
 	pageUnknown
 	pageCancelled
+	pageInvalidResponse
 )
 
 type pageOutcome struct {
@@ -196,6 +197,16 @@ func (c *Crawler) process(ctx context.Context, url string, client *auth.Client) 
 		return pageOutcome{kind: pageNotFound, reason: strconv.Itoa(resp.StatusCode)}
 	case http.StatusOK:
 		// falls through to parsing below
+	case http.StatusMovedPermanently, http.StatusFound,
+		http.StatusSeeOther, http.StatusTemporaryRedirect,
+		http.StatusPermanentRedirect:
+		location, err := resp.Location()
+		if err == nil && location.Scheme == resp.Request.URL.Scheme &&
+			strings.EqualFold(location.Host, resp.Request.URL.Host) &&
+			strings.TrimRight(location.Path, "/") == "/ukinfo" {
+			return pageOutcome{kind: pageInvalidResponse, reason: "uk_access_notice"}
+		}
+		return pageOutcome{kind: pageInvalidResponse, reason: "redirect_rejected"}
 	default:
 		return pageOutcome{
 			kind: pageRetryable, failClass: storage.FailStrikeable,
@@ -208,7 +219,7 @@ func (c *Crawler) process(ctx context.Context, url string, client *auth.Client) 
 		if ctx.Err() != nil {
 			return pageOutcome{kind: pageCancelled}
 		}
-		return pageOutcome{kind: pageUnknown, reason: "parse_failed"}
+		return pageOutcome{kind: pageInvalidResponse, reason: "parse_failed"}
 	}
 	title := doc.Find("title").Text()
 	if isRateLimitTitle(title) {
@@ -216,6 +227,11 @@ func (c *Crawler) process(ctx context.Context, url string, client *auth.Client) 
 			kind: pageRetryable, failClass: storage.FailRateLimited,
 			reason: "http_200_rate_limit_title",
 		}
+	}
+
+	pageTitle := strings.TrimSpace(strings.TrimSuffix(title, c.cfg.TitleSuffix))
+	if strings.EqualFold(pageTitle, "Important Information for UK Users") {
+		return pageOutcome{kind: pageInvalidResponse, reason: "uk_access_notice"}
 	}
 
 	metrics.PagesProcessed.Inc()
@@ -226,8 +242,11 @@ func (c *Crawler) process(ctx context.Context, url string, client *auth.Client) 
 	}
 
 	date := strings.TrimSpace(doc.Find("date").First().Text())
-	durStr := doc.Find(`meta[property="video:duration"]`).AttrOr("content", "")
-	dur, _ := strconv.Atoi(durStr)
+	durStr, hasDuration := doc.Find(`meta[property="video:duration"]`).Attr("content")
+	dur, err := strconv.Atoi(strings.TrimSpace(durStr))
+	if pageTitle == "" || date == "" || !hasDuration || err != nil || dur < 0 {
+		return pageOutcome{kind: pageInvalidResponse, reason: "invalid_video_metadata"}
+	}
 	v := model.Video{
 		URL:      url,
 		Title:    strings.TrimSuffix(title, c.cfg.TitleSuffix),
@@ -295,6 +314,13 @@ func (c *Crawler) handleOutcome(ctx context.Context, job *storage.Job, out pageO
 			_, err := c.frontier.Fail(fctx, job, out.failClass)
 			return err
 		})
+	case pageInvalidResponse:
+		// Reuse delayed retry without URL strikes: this response does not
+		// establish that the video is dead.
+		c.resolve(func(fctx context.Context) error {
+			_, err := c.frontier.Fail(fctx, job, storage.FailRateLimited)
+			return err
+		})
 	case pageUnknown:
 		c.resolve(func(fctx context.Context) error {
 			_, err := c.frontier.Fail(fctx, job, storage.FailStrikeable)
@@ -338,7 +364,7 @@ func (f *workerFailures) observe(workerID int, route string, out pageOutcome) {
 		f.consecutive = 0
 		f.rateLimited = 0
 		return
-	case pageRetryable, pageUnknown:
+	case pageRetryable, pageUnknown, pageInvalidResponse:
 		f.consecutive++
 		if out.kind == pageRetryable && out.failClass == storage.FailRateLimited {
 			f.rateLimited++
@@ -370,6 +396,20 @@ func (c *Crawler) workerLoop(ctx context.Context, workerID int, proxyURL string,
 	}
 	var failures workerFailures
 	client := auth.NewClient(c.jar, proxyURL)
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return http.ErrUseLastResponse
+		}
+		destination := c.canonicalize(req.URL.String())
+		if destination == "" {
+			return http.ErrUseLastResponse
+		}
+		original := c.canonicalize(via[0].URL.String())
+		if strings.Contains(original, c.cfg.VideoPattern) && destination != original {
+			return http.ErrUseLastResponse
+		}
+		return nil
+	}
 	defer client.CloseIdleConnections()
 	limiter := rate.NewLimiter(rate.Every(c.cfg.RateLimit), 1)
 
@@ -389,6 +429,12 @@ func (c *Crawler) workerLoop(ctx context.Context, workerID int, proxyURL string,
 			continue
 		}
 
+		if c.canonicalize(job.URL) == "" {
+			c.resolve(func(fctx context.Context) error { return c.frontier.Ack(fctx, job) })
+			log.Printf("[INFO] worker=%d route=%s skipped excluded crawl URL", workerID, route)
+			continue
+		}
+
 		if err := limiter.Wait(ctx); err != nil {
 			c.resolve(func(fctx context.Context) error { return c.frontier.Nack(fctx, job) })
 			return
@@ -400,8 +446,12 @@ func (c *Crawler) workerLoop(ctx context.Context, workerID int, proxyURL string,
 				os.Getpid(), workerID, route, job.ID, job.URL, time.Now().UnixNano())
 		}
 		out := c.process(ctx, job.URL, client)
+		if out.kind == pageInvalidResponse {
+			log.Printf("[WARN] worker=%d route=%s reason=%s; response rejected, scheduling retry without URL strike",
+				workerID, route, out.reason)
+		}
 		if c.debug {
-			c.recordTestFinish(workerID, job.URL, out.kind)
+			c.recordTestFinish(workerID, job.URL, out)
 			log.Printf("[DEBUG] event=process_finish pid=%d worker=%d route=%s job=%q url=%q at_ns=%d kind=%d reason=%q",
 				os.Getpid(), workerID, route, job.ID, job.URL, time.Now().UnixNano(), out.kind, out.reason)
 		}
@@ -412,12 +462,21 @@ func (c *Crawler) workerLoop(ctx context.Context, workerID int, proxyURL string,
 			c.testStored[workerID]++
 			c.mu.Unlock()
 		}
+		if out.kind == pageInvalidResponse && out.reason == "uk_access_notice" {
+			log.Printf("[ERROR] worker=%d route=%s stopping; reason=uk_access_notice", workerID, route)
+			if c.debug {
+				c.mu.Lock()
+				c.testRetired[workerID] = "access_blocked"
+				c.mu.Unlock()
+			}
+			return
+		}
 		if failures.consecutiveRateLimited >= workerRateLimitStop {
 			log.Printf("[ERROR] worker=%d route=%s stopping after %d consecutive rate limits; last_reason=%s",
 				workerID, route, failures.consecutiveRateLimited, out.reason)
 			if c.debug {
 				c.mu.Lock()
-				c.testRetired[workerID] = true
+				c.testRetired[workerID] = "rate_limited"
 				c.mu.Unlock()
 			}
 			return

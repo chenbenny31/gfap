@@ -147,14 +147,19 @@ func main() {
 			log.Printf("[INFO] Test final checkpoint complete: %+v", stats)
 		}
 		if err := errors.Join(crawlErr, checkpointErr, ctx.Err()); err != nil {
-			log.Fatalf("[ERROR] Test failed: %v", err)
+			log.Printf("[ERROR] Test failed: %v", err)
+			log.Print(c.TestWorkerSummary())
+			os.Exit(1)
 		}
 		if err := c.SaveTest(ctx); err != nil {
-			log.Fatalf("[ERROR] Failed to save test results: %v", err)
+			log.Printf("[ERROR] Failed to save test results: %v", err)
+			log.Print(c.TestWorkerSummary())
+			os.Exit(1)
 		}
 		res := fmt.Sprintf("Visited %d videos, target %d\n", c.Count(), c.TargetCount())
 		log.Print(res)
 		fmt.Print(res)
+		log.Print(c.TestWorkerSummary())
 		return
 	}
 
